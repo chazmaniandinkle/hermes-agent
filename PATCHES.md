@@ -16,6 +16,22 @@ Lives on the `local` branch. Read before editing any file under "Files to Watch.
 
 ---
 
+## ⚙️ Gateway processes on this node — manage ALL of them
+
+This node runs **one gateway process per agent profile**, each a separate launchd job with its own bot tokens/config, but **all sharing this single checkout** (one working tree, no worktrees → **the branch is node-global**):
+
+| launchd job | profile | bots | config | logs |
+|-------------|---------|------|--------|------|
+| `ai.hermes.gateway` | default | Telegram **Hermes** (`cogos_hermes_bot`) + Discord **Whirl** | `~/.hermes/.env` | `~/.hermes/logs/` |
+| `ai.hermes.gateway-cog` | `--profile cog` | Telegram **Cog** (`cogos_cog_bot`) + Discord **Hermes_bot** | `~/.hermes/profiles/cog/.env` | `~/.hermes/profiles/cog/logs/` |
+
+- **One gateway serves ALL its channels** (Telegram + Discord + …) as adapters in a single process — *not* one gateway per channel. "Gateway running with 2 platform(s)" = both adapters in one process.
+- **Code is shared and node-global.** Both jobs have `WorkingDirectory=/Users/slowbro/.hermes/hermes-agent` and run whatever single branch is checked out (`local`). A `git checkout main` / `git reset` flips **both** gateways to unpatched code on their next restart. **The "stay on `local`" discipline is node-wide, not per-profile.**
+- **A code change is only live after each process restarts.** Python loads code at process start; flipping the on-disk checkout does NOT affect an already-running gateway. **After any branch change/rebase, restart EVERY gateway** (`launchctl kickstart -k gui/$(id -u)/<job>`) or you'll have one profile patched and another silently running stale code (this exact split happened 2026-06-03: default was restarted onto `local`, cog kept running boot-time `main` code until separately restarted).
+- **Enumerate before acting:** `launchctl list | grep hermes` (note PID vs `-`), `ps -o pid,lstart,command -p <pids>` (start time tells you which branch's code a process loaded), and match the bot identity (`getMe`) to the bot in question. Never assume the gateway you found is the only one.
+
+---
+
 ## At-Risk Patches (vendored-repo modifications — clobbered by `git reset`, replayed by rebase)
 
 ### PATCH-001: Progressive memory eviction (`tools/memory_tool.py`)
