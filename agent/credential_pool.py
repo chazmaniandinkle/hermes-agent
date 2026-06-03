@@ -1310,6 +1310,48 @@ class CredentialPool:
                 self._mark_exhausted(entry, None)
             return None
 
+        # --- PATCH-007 (local): Claude Code owns its OAuth credential --------
+        # Never POST claude_code's single-use refresh token. Claude Code is the
+        # sole writer of the macOS Keychain entry it reads back; if Hermes
+        # POSTs the shared refresh token it (a) races Claude Code and (b) lands
+        # the rotated pair only in ~/.claude/.credentials.json, which Claude
+        # Code >=2.1.114 ignores in favour of the Keychain — orphaning the
+        # rotation and forcing a manual `claude /login`. Instead: mirror what
+        # Claude Code currently holds (keychain-first via the resync helper);
+        # if even that is stale, delegate the refresh to the *owner* by running
+        # the user-space actuator (a headless `claude -p`, single-flight), then
+        # re-mirror. Single source of truth + single writer ⇒ no race.
+        # Degrades safely: on any failure we fall through to _mark_exhausted,
+        # and the existing exhausted-entry keychain resync in _available_entries
+        # still recovers the credential on the next selection (today's behaviour).
+        # Placed ahead of the openai-codex dispatch below: this branch returns
+        # unconditionally for claude_code and must never reach
+        # _refresh_entry_impl's generic anthropic POST path.
+        if self.provider == "anthropic" and entry.source == "claude_code":
+            synced = self._sync_anthropic_entry_from_credentials_file(entry)
+            if not self._entry_needs_refresh(synced):
+                return synced  # Claude Code already keeps it fresh
+            try:
+                import subprocess as _subprocess
+                actuator = os.path.expanduser("~/.hermes/bin/claude-token-refresh")
+                if os.path.exists(actuator):
+                    _subprocess.run(
+                        [actuator], timeout=45,
+                        stdin=_subprocess.DEVNULL,
+                        stdout=_subprocess.DEVNULL,
+                        stderr=_subprocess.DEVNULL,
+                    )
+            except Exception as _exc:
+                logger.debug("claude_code refresh actuator failed: %s", _exc)
+            synced = self._sync_anthropic_entry_from_credentials_file(synced)
+            if not self._entry_needs_refresh(synced):
+                return synced  # owner refreshed; adopted the fresh keychain token
+            if force:
+                # Refresh token likely revoked → needs interactive `claude /login`.
+                self._mark_exhausted(entry, None)
+            return None
+        # --- end PATCH-007 ---------------------------------------------------
+
         # Codex and xAI OAuth refresh tokens are single-use.  The
         # sync→POST→write-back sequence below must run atomically across Hermes
         # processes: otherwise two processes can both adopt the same on-disk
