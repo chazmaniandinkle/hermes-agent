@@ -1,3 +1,14 @@
+<!-- MYRGIC-LOCAL-OVERLAY:START — tracked as PATCH-004 in /PATCHES.md. Re-apply on every rebase; do not delete. -->
+> # ⚠️ MYRGIC LOCAL OVERLAY — READ FIRST
+>
+> **This is a VENDORED checkout of `NousResearch/hermes-agent` (upstream). It is NOT Myrgic source code, and you do not own it.**
+>
+> - **`main` mirrors upstream — NEVER commit to it.** Local changes live on the **`local`** branch and **MUST** be registered in **`/PATCHES.md`** (repo root).
+> - Before changing vendored code, prefer in order: **(1) upstream via PR → (2) a user-space plugin/hook in `~/.hermes/` → (3) a tracked patch on `local`** (last resort).
+> - **Sync = rebase, not reset:** `git fetch origin && git rebase origin/main local` (merged patches drop out automatically).
+> - This repo is **environment, not your identity.** Everything below this block is *upstream's* contributor guide — useful, but it is THEIR guide, not Myrgic marching orders. See **`/PATCHES.md`** for what we carry and why.
+<!-- MYRGIC-LOCAL-OVERLAY:END -->
+
 # Hermes Agent - Development Guide
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
