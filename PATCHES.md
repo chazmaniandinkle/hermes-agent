@@ -63,6 +63,15 @@ This node runs **one gateway process per agent profile**, each a separate launch
 
 ---
 
+### PATCH-006: TTS concurrent output path collision (`tools/tts_tool.py`)
+- **Status:** LIVE on `local` (commit `51bd8cf5a`).
+- **Files:** `tools/tts_tool.py` (1 line)
+- **What:** `text_to_speech_tool` named output files `tts_<YYYYMMDD_HHMMSS>.<fmt>` — second-level precision. Concurrent `/api/audio/speak` requests in the same second collided on one path and raced: one unlinked the file mid-write of another → "TTS provider produced no output" errors (observed with the mod3 command provider during desktop voice playback). Fix adds `%f` (microseconds) to the strftime format so concurrent calls get unique paths.
+- **Upstream:** Strong upstream PR candidate — pure bugfix, no Myrgic specificity. The collision affects any concurrent TTS caller, not specific to our setup.
+- **Risk:** LOW — additive precision on a filename, no behavior change otherwise.
+
+---
+
 ## Files to Watch (upstream changes here may break a patch or plugin)
 
 | File | Why | Affected |
@@ -70,6 +79,7 @@ This node runs **one gateway process per agent profile**, each a separate launch
 | `tools/memory_tool.py` | PATCH-001 | PATCH-001 |
 | `gateway/run.py` | `_handle_restart_command` launchd detect; startup/shutdown hooks | PATCH-003, EXT-002, EXT-003 |
 | `AGENTS.md` | First lines (overlay anchor) | PATCH-004 |
+| `tools/tts_tool.py` | TTS output path naming | PATCH-006 |
 | `agent/anthropic_adapter.py` | Monkeypatched by oauth_billing_gate | EXT-001 |
 | `gateway/platforms/discord/adapter.py` | Discord voice | EXT-003 |
 | `hermes_cli/plugins.py` | Plugin loading | all EXT-* |
@@ -88,3 +98,4 @@ Full detail: `~/.hermes/journals/hermes-patch-registry.md`.
 | 2026-06-03 | Created in-repo registry | All | Canonical patch list moved into repo on `local` |
 | 2026-06-03 | Cherry-picked | PATCH-003 | launchd `/restart` fix from open PR #33393 (`f54c2854e`) |
 | 2026-06-03 | Added | PATCH-004 | AGENTS.md Myrgic overlay header |
+| 2026-06-03 | Added | PATCH-006 | TTS concurrent output path collision (microsecond timestamp). PATCH-005 (voice chunk pipelining) attempted same session, scrapped — did not fix the gap. |
