@@ -72,6 +72,44 @@ This node runs **one gateway process per agent profile**, each a separate launch
 
 ---
 
+### PATCH-007: Claude Code OAuth credential is read-only (`agent/credential_pool.py`)
+- **Status:** ON `local` (this commit). **Live after each gateway restart.**
+- **Files:** `agent/credential_pool.py` (`_refresh_entry`, +~30 lines, additive branch at top)
+- **Companion (user-space, EXT-010):** `~/.hermes/bin/claude-token-refresh` — the actuator.
+- **What:** For `provider=="anthropic" and source=="claude_code"`, Hermes no longer POSTs the credential's **single-use OAuth refresh token**. Claude Code (CC) is the sole holder/writer of that token (macOS Keychain `Claude Code-credentials`); Hermes POSTing it raced CC and wrote the rotated pair only to `~/.claude/.credentials.json` — a file CC >=2.1.114 ignores — orphaning the rotation and forcing a manual `claude /login`. The drift was observed live 2026-06-03: file token `eb374e46…/exp 00:08` vs keychain `922ff595…/exp 00:49`, one refresh-cycle apart. New behaviour: **mirror** whatever CC currently holds (keychain-first, via the existing `_sync_anthropic_entry_from_credentials_file`); if even the keychain is stale, **delegate** refresh to the owner by running the EXT-010 actuator (a single-flight headless `claude -p`, ~5–9s, only fires when genuinely stale), then re-mirror. One source of truth + one writer ⇒ no race.
+- **Why this is the root-cause fix:** the prior 401 bursts after every `/login` or CC token rotation came from Hermes holding/POSTing a token CC had rotated away. Hermes' reconcile stack (keychain-first read, exhausted-entry resync, 5-min 401 cooldown) recovered *reactively* but always after a burst. PATCH-007 makes recovery *structural* — Hermes can't desync because it never owns the refresh.
+- **Safety / degradation:** any failure in the branch (actuator missing, subprocess error, still-stale) falls through to `_mark_exhausted` → the **existing** exhausted-entry keychain resync in `_available_entries` recovers on the next selection (no worse than pre-patch). The actuator subprocess runs under the pool lock; a refresh stalls that lock ~5–9s, but only near token expiry (~once per token lifetime), not per request. Irreducible floor: a genuinely **revoked** refresh token can't be re-auth'd headlessly → surfaces as exhausted; needs interactive `claude /login`.
+- **Verified:** module compiles + imports in venv; unit test (POST sentinel raises if touched) confirms all three paths — fresh / owner-refreshed / revoked — **never POST** the refresh token; actuator fast-path (fresh) exits 0 in <1s, forced-stale path runs `claude -p` and exits 0 in ~9s.
+- **Upstream:** Candidate, but Keychain-vs-file is macOS+CC-specific; the general principle (don't auto-refresh an externally-owned single-use OAuth token) may interest upstream. Until then, local.
+- **Interaction note:** EXT-001 `oauth_billing_gate` monkeypatches `agent/anthropic_adapter.py` (outbound billing/routing) — orthogonal to this pool-refresh gate, no shared symbol, but re-check if either changes refresh behaviour.
+- **Reconciler action:** watch `agent/credential_pool.py` `_refresh_entry` for upstream churn; the branch is self-contained and re-appliable. Drop only if upstream adds an equivalent "external-owner read-only" credential mode.
+
+---
+
+### PATCH-008: Claude Code OAuth resolve/write path is read-only (`agent/anthropic_adapter.py`)
+- **Status:** ON `local` (this commit). **Live after each gateway restart.**
+- **Files:** `agent/anthropic_adapter.py` (`_refresh_oauth_token` → read-only actuator delegation; `_write_claude_code_credentials` → no-op). Tests updated: `tests/agent/test_anthropic_adapter.py` (`TestRefreshOauthToken`, `TestWriteClaudeCodeCredentials`), `tests/agent/test_auxiliary_client.py`.
+- **Companion:** EXT-010 actuator `~/.hermes/bin/claude-token-refresh` (shared with PATCH-007).
+- **What:** Completes PATCH-007. PATCH-007 made `credential_pool._refresh_entry` read-only but left a **second, uncovered refresh path**: `resolve_anthropic_token()` → `_resolve_claude_code_token_from_credentials()` → `_refresh_oauth_token()`, reachable from agent init / usage polls / `_refresh_provider_credentials`. That path still **POSTed** the single-use refresh token (`refresh_anthropic_oauth_pure`) **and wrote** `~/.claude/.credentials.json` (`_write_claude_code_credentials`). Now `_refresh_oauth_token` delegates to the owner via the EXT-010 actuator then re-reads keychain-first (no POST, no write), and `_write_claude_code_credentials` is a hard **no-op** (belt-and-suspenders so no Hermes path can write CC's file; the remaining PATCH-007-dead call sites in `credential_pool` stay import-safe).
+- **Why:** Observed live 2026-06-04 *after* the CogOS kernel WriteBack fix (myrgic/cogos#363/#364) eliminated the ~10s kernel churn: a **single** stale write of `~/.claude/.credentials.json` on a token resolve still forced a `/login` (file token ≠ keychain token, keychain valid). The kernel was the dominant (10s-loop) poisoner; this adapter path was the residual (per-event) poisoner. Same root shape as PATCH-007 and the kernel fix: Hermes/kernel must be a strict read-only mirror of a credential Claude Code owns. See [[feedback_convergent_readonly_mirror_pattern]].
+- **Safety / degradation:** read-only; on a genuinely revoked token the actuator can't re-auth headlessly → returns None → caller falls back / surfaces interactive `claude /login` (no worse than before). Actuator is single-flight, fires only when stale.
+- **Verified:** module compiles + imports in venv; 6 updated unit tests pass (POST/write sentinels raise `AssertionError` if touched — proves no POST, no file write); full delta vs pre-patch baseline = **0 new failures**. (Note: 14 pre-existing `TestResolveAnthropicToken`/`TestResolveWithRefresh` failures on `local` are unrelated test-isolation debt predating PATCH-008 — separate cleanup.)
+- **Interaction note:** EXT-001 `oauth_billing_gate` monkeypatches this same file (outbound billing/routing) — orthogonal to these two credential functions, no shared symbol; re-check if either changes refresh behaviour.
+- **Reconciler action:** watch `agent/anthropic_adapter.py` `_refresh_oauth_token` / `_write_claude_code_credentials` for upstream churn; both are self-contained and re-appliable. Drop only if upstream adds an "external-owner read-only" credential mode.
+
+---
+
+### PATCH-009: `/s` alias for `/steer` (`ui-tui/src/app/slash/commands/core.ts`)
+- **Status:** ON `local` (this commit). **Live after `npm run build` in `ui-tui/` + TUI relaunch.**
+- **Files:** `ui-tui/src/app/slash/commands/core.ts` (one line: `aliases: ['s']` on the `steer` command).
+- **What:** Adds `s` as a short alias for the TUI `/steer` slash command (inject a message after the next tool call without interrupting). Uses the existing `aliases?: string[]` field on `SlashCommand` — `registry.ts` already flat-maps `[cmd.name, ...cmd.aliases]` into the command lookup, so no dispatch change needed.
+- **Why:** User convenience — `/steer` is used mid-turn and a single-char alias is faster to type. Cosmetic/ergonomic, not behavioral.
+- **Collision check:** no existing command or alias named `s` (verified against `core.ts`/`session.ts`). Distinct from the `/q → queue` lesson (#31983): `s` was free.
+- **Verified:** `slashParity.test.ts` 3/3 pass; `npm run build` clean (2.9mb bundle); alias confirmed compiled into `dist/entry.js` (`aliases:["s"]...name:"steer"`).
+- **Reconciler action:** trivially re-appliable. Upstream-worthy as a standalone convenience PR if desired; until then carry here. Drop if upstream adds the same alias.
+
+---
+
 ## Files to Watch (upstream changes here may break a patch or plugin)
 
 | File | Why | Affected |
@@ -80,13 +118,15 @@ This node runs **one gateway process per agent profile**, each a separate launch
 | `gateway/run.py` | `_handle_restart_command` launchd detect; startup/shutdown hooks | PATCH-003, EXT-002, EXT-003 |
 | `AGENTS.md` | First lines (overlay anchor) | PATCH-004 |
 | `tools/tts_tool.py` | TTS output path naming | PATCH-006 |
-| `agent/anthropic_adapter.py` | Monkeypatched by oauth_billing_gate | EXT-001 |
+| `agent/anthropic_adapter.py` | Monkeypatched by oauth_billing_gate; `_refresh_oauth_token`/`_write_claude_code_credentials` read-only | EXT-001, PATCH-008 |
+| `agent/credential_pool.py` | `_refresh_entry` claude_code read-only branch | PATCH-007, EXT-010 |
+| `ui-tui/src/app/slash/commands/core.ts` | `/steer` carries `aliases: ['s']` | PATCH-009 |
 | `gateway/platforms/discord/adapter.py` | Discord voice | EXT-003 |
 | `hermes_cli/plugins.py` | Plugin loading | all EXT-* |
 
 ## User-Space Extensions (safe — outside this repo, survive any reset)
 
-EXT-001 `oauth_billing_gate` · EXT-002 `mod3_session` · EXT-003 `mod3_voice` · EXT-004 `bw_bridge` · EXT-005 `skill_relevance_gate` · EXT-006 `hermes-achievements` · EXT-007 `auto-voice-reply` hook · EXT-008 `bw-eclipse-key` hook · EXT-009 `mod3-voice-bootstrap` hook.
+EXT-001 `oauth_billing_gate` · EXT-002 `mod3_session` · EXT-003 `mod3_voice` · EXT-004 `bw_bridge` · EXT-005 `skill_relevance_gate` · EXT-006 `hermes-achievements` · EXT-007 `auto-voice-reply` hook · EXT-008 `bw-eclipse-key` hook · EXT-009 `mod3-voice-bootstrap` hook · EXT-010 `claude-token-refresh` (`~/.hermes/bin/`, actuator for PATCH-007 — single-flight headless `claude -p` to refresh the CC-owned keychain token on demand).
 Full detail: `~/.hermes/journals/hermes-patch-registry.md`.
 
 ---
@@ -97,5 +137,8 @@ Full detail: `~/.hermes/journals/hermes-patch-registry.md`.
 |------|--------|-------|-------|
 | 2026-06-03 | Created in-repo registry | All | Canonical patch list moved into repo on `local` |
 | 2026-06-03 | Cherry-picked | PATCH-003 | launchd `/restart` fix from open PR #33393 (`f54c2854e`) |
+| 2026-06-03 | Added | PATCH-007 + EXT-010 | Claude Code OAuth credential read-only: stop Hermes POSTing CC's single-use refresh token (no race), delegate refresh to the owner via headless `claude -p` actuator. Root-cause fix for post-`/login` 401 bursts. |
+| 2026-06-04 | Added | PATCH-008 | Completes PATCH-007: the uncovered `anthropic_adapter` resolve path (`_refresh_oauth_token`) still POSTed + wrote `~/.claude/.credentials.json`. Made it read-only (actuator delegate + keychain re-read); `_write_claude_code_credentials` → no-op. Residual file-poisoner after the CogOS kernel WriteBack fix (myrgic/cogos#363/#364). |
 | 2026-06-03 | Added | PATCH-004 | AGENTS.md Myrgic overlay header |
 | 2026-06-03 | Added | PATCH-006 | TTS concurrent output path collision (microsecond timestamp). PATCH-005 (voice chunk pipelining) attempted same session, scrapped — did not fix the gap. |
+| 2026-06-04 | Added | PATCH-009 | `/s` alias for the TUI `/steer` slash command (`ui-tui/src/app/slash/commands/core.ts`). One-line `aliases: ['s']`. Parity tests + build verified. |
