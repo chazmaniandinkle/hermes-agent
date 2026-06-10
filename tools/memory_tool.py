@@ -43,6 +43,38 @@ def get_memory_dir() -> Path:
 from tools.memory_tool_store import (  # noqa: E402,F401  (re-exports)
     ENTRY_DELIMITER, MEMORY_BLOCK_HEADERS, MemoryStore, _scan_memory_content)
 
+# Eviction threshold (progressive-memory-eviction, incident MEMDUMP-001): when an
+# add() would push a store above this fraction of its char limit, oldest entries
+# are silently paged out to the substrate (Tier 1 -> Tier 3) instead of surfacing
+# a capacity error. 0.75 keeps standing headroom so the store never rides the limit.
+# The resolvers live HERE (not in memory_tool_store) because tests patch them here;
+# MemoryStore reads them lazily, same convention as get_memory_dir.
+EVICTION_THRESHOLD = 0.75
+
+
+def get_substrate_overflow_dir() -> Path:
+    """Directory where evicted memory entries land as cogdocs.
+
+    Primary: the CogOS substrate's episodic overflow dir, when the substrate
+    workspace exists on this node. Fallback: a profile-independent overflow dir
+    under ~/.hermes/memories. Created on demand."""
+    substrate_root = Path.home() / "workspaces" / "cog" / ".cog"
+    if substrate_root.is_dir():
+        overflow = substrate_root / "mem" / "episodic" / "hermes-overflow"
+    else:
+        overflow = Path.home() / ".hermes" / "memories" / "hermes-overflow"
+    overflow.mkdir(parents=True, exist_ok=True)
+    return overflow
+
+
+def get_tier2_index_path() -> Path:
+    """Tier 2 index cogdoc pointing at evicted entries (not created here; a
+    missing index means pointer appends are skipped)."""
+    substrate_root = Path.home() / "workspaces" / "cog" / ".cog"
+    if substrate_root.is_dir():
+        return substrate_root / "mem" / "hermes-memory-index.cog.md"
+    return Path.home() / ".hermes" / "memories" / "hermes-memory-index.cog.md"
+
 
 def load_on_disk_store() -> "MemoryStore":
     """Fresh on-disk MemoryStore with configured limits/flags for contexts with no live

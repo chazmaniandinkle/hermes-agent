@@ -271,6 +271,18 @@ class MemoryStore:
         def _add(entries, limit):
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
+            # progressive-memory-eviction (MEMDUMP-001): page oldest entries out to
+            # the substrate while this add would cross EVICTION_THRESHOLD. Never for
+            # an entry that can't fit an empty store (stays a hard error, no drain
+            # loop). Eviction failure is silent: fall through to the capacity error.
+            from tools import memory_tool as _mt
+            new_total = len(ENTRY_DELIMITER.join(entries + [content]))
+            if new_total > limit * _mt.EVICTION_THRESHOLD and len(content) <= limit:
+                while new_total > limit * _mt.EVICTION_THRESHOLD and self._entries_for(target):
+                    if not self._evict_oldest_to_substrate(target):
+                        break
+                    entries = self._entries_for(target)
+                    new_total = len(ENTRY_DELIMITER.join(entries + [content]))
             if len(ENTRY_DELIMITER.join(entries + [content])) > limit:
                 return self._failure_with_entries(target, (
                     f"Memory at {self._char_count(target):,}/{limit:,} chars. Adding this entry "
@@ -399,6 +411,80 @@ class MemoryStore:
             replaced_fields = {"replaced_entries": replaced} if replaced else {}
             return working, f"Applied {len(operations)} operation(s).", replaced_fields
         return self._mutate(target, _apply)
+
+    # -- progressive-memory-eviction: Tier 1 -> Tier 3 (MEMDUMP-001) --
+
+    @staticmethod
+    def _write_cogdoc_to_substrate(content: str, target: str) -> str:
+        """Write an evicted entry to the substrate overflow dir as a cogdoc and
+        return its cog:// URI. Best-effort Tier 2 index pointer append. Raises
+        OSError on cogdoc write failure (the caller aborts the eviction)."""
+        import hashlib
+        from tools import memory_tool as _mt  # resolvers are patched there
+        overflow_dir = _mt.get_substrate_overflow_dir()
+        overflow_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        date = time.strftime("%Y-%m-%d", time.gmtime())
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:8]
+        doc_id = f"hermes-evicted-{target}-{stamp}-{digest}"
+        filename = f"{doc_id}.cog.md"
+        doc = ("---\n" f"id: {doc_id}\n" f"created: '{date}'\n" "source: hermes-memory-eviction\n"
+               f"target: {target}\n" "tags:\n" "  - memory-overflow\n" "  - hermes-evicted\n"
+               "---\n" "\n" f"{content}\n")
+        (overflow_dir / filename).write_text(doc, encoding="utf-8")
+        uri = f"cog://mem/overflow/{filename}"
+        try:
+            index = _mt.get_tier2_index_path()
+            if index.exists():
+                first_line = content.strip().splitlines()[0] if content.strip() else ""
+                summary = first_line.replace("|", "/")[:60]
+                with open(index, "a", encoding="utf-8") as f:
+                    f.write(f"| {summary} | {uri} | {date} | memory-overflow,hermes-evicted,{target} |\n")
+        except OSError:
+            logger.warning("Tier 2 index append failed for %s (eviction kept)", uri)
+        return uri
+
+    def _evict_oldest_to_substrate(self, target: str) -> bool:
+        """Evict the oldest Tier 1 entry to the substrate. Returns success.
+        Removed from Tier 1 only after the cogdoc write succeeds. Does NOT persist:
+        on the add() path it runs inside ``_mutate`` (file lock held), which
+        persists the resulting entry list itself. Failures are silent (logged)."""
+        entries = self._entries_for(target)
+        if not entries:
+            return False
+        try:
+            uri = self._write_cogdoc_to_substrate(entries[0], target)
+        except Exception as e:  # noqa: BLE001 — silent by design (MEMDUMP-001)
+            logger.warning("Memory eviction failed for target=%s: %s", target, e)
+            return False
+        if not uri:
+            return False
+        self._set_entries(target, entries[1:])
+        logger.info("Evicted oldest %s entry to %s", target, uri)
+        return True
+
+    def scan_tier2_index_for_hot_entries(self) -> List[str]:
+        """cog:// URIs of Tier 2 index rows tagged 'hot'; never raises."""
+        from tools import memory_tool as _mt
+        index = _mt.get_tier2_index_path()
+        if not index.exists():
+            return []
+        try:
+            raw = index.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        hot: List[str] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) < 4:
+                continue
+            uri, tags = cells[1], cells[3]
+            if "hot" in {t.strip().lower() for t in tags.split(",")} and uri:
+                hot.append(uri)
+        return hot
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
