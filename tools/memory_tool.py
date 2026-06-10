@@ -23,6 +23,7 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -65,6 +66,42 @@ MEMORY_BLOCK_HEADERS = {
 }
 
 ENTRY_DELIMITER = "\n§\n"
+
+# Eviction threshold (incident MEMDUMP-001): when an add() would push a store
+# above this fraction of its char limit, oldest entries are silently paged out
+# to the substrate (Tier 1 → Tier 3) instead of surfacing a capacity error.
+# 0.75 keeps standing headroom so the store never rides the hard limit.
+EVICTION_THRESHOLD = 0.75
+
+
+def get_substrate_overflow_dir() -> Path:
+    """Resolve the directory where evicted memory entries land as cogdocs.
+
+    Primary: the CogOS substrate's episodic overflow dir, when the substrate
+    workspace exists on this node. Fallback: a profile-independent overflow
+    dir under ~/.hermes/memories. Both derive from Path.home() so tests can
+    redirect everything by patching home. The chosen dir is created on demand.
+    """
+    substrate_root = Path.home() / "workspaces" / "cog" / ".cog"
+    if substrate_root.is_dir():
+        overflow = substrate_root / "mem" / "episodic" / "hermes-overflow"
+    else:
+        overflow = Path.home() / ".hermes" / "memories" / "hermes-overflow"
+    overflow.mkdir(parents=True, exist_ok=True)
+    return overflow
+
+
+def get_tier2_index_path() -> Path:
+    """Resolve the Tier 2 index cogdoc that points at evicted entries.
+
+    Same primary/fallback resolution as get_substrate_overflow_dir(). The
+    index is append-only from this module's perspective; it is not created
+    here — a missing index means pointer appends are skipped (best-effort).
+    """
+    substrate_root = Path.home() / "workspaces" / "cog" / ".cog"
+    if substrate_root.is_dir():
+        return substrate_root / "mem" / "hermes-memory-index.cog.md"
+    return Path.home() / ".hermes" / "memories" / "hermes-memory-index.cog.md"
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +462,25 @@ class MemoryStore:
             new_entries = entries + [content]
             new_total = len(ENTRY_DELIMITER.join(new_entries))
 
+            # Silent eviction (Tier 1 → Tier 3, incident MEMDUMP-001): when
+            # this add would push the store above EVICTION_THRESHOLD of the
+            # limit, page oldest entries out to the substrate as cogdocs
+            # until we're back under the threshold. Never evict for an entry
+            # that couldn't fit even in an empty store — that stays a hard
+            # error rather than an eviction loop that drains the store.
+            # Eviction failure is silent here: we fall through to the
+            # existing capacity error, never a new user-visible failure mode.
+            if new_total > limit * EVICTION_THRESHOLD and len(content) <= limit:
+                while (
+                    new_total > limit * EVICTION_THRESHOLD
+                    and self._entries_for(target)
+                ):
+                    if not self._evict_oldest_to_substrate(target):
+                        break
+                    entries = self._entries_for(target)
+                    new_entries = entries + [content]
+                    new_total = len(ENTRY_DELIMITER.join(new_entries))
+
             if new_total > limit:
                 current = self._char_count(target)
                 return self._consolidation_failure({
@@ -691,6 +747,125 @@ class MemoryStore:
         """
         block = self._system_prompt_snapshot.get(target, "")
         return block if block else None
+
+    # -- Eviction (Tier 1 → Tier 3) --
+
+    @staticmethod
+    def _write_cogdoc_to_substrate(content: str, target: str) -> str:
+        """Write an evicted entry to the substrate overflow dir as a cogdoc.
+
+        Returns the cog:// URI of the written cogdoc. Appends a pointer row
+        to the Tier 2 index when the index exists (best-effort: an index
+        append failure never fails the eviction). Raises OSError/IOError on
+        cogdoc write failure — the caller decides whether that aborts the
+        eviction (it does) and stays silent toward the user (it does).
+        """
+        overflow_dir = get_substrate_overflow_dir()
+        # The resolver normally creates the dir, but callers/tests may
+        # substitute a bare path — creation here is what the contract owns.
+        overflow_dir.mkdir(parents=True, exist_ok=True)
+
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        date = time.strftime("%Y-%m-%d", time.gmtime())
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:8]
+        doc_id = f"hermes-evicted-{target}-{stamp}-{digest}"
+        filename = f"{doc_id}.cog.md"
+
+        doc = (
+            "---\n"
+            f"id: {doc_id}\n"
+            f"created: '{date}'\n"
+            "source: hermes-memory-eviction\n"
+            f"target: {target}\n"
+            "tags:\n"
+            "  - memory-overflow\n"
+            "  - hermes-evicted\n"
+            "---\n"
+            "\n"
+            f"{content}\n"
+        )
+        (overflow_dir / filename).write_text(doc, encoding="utf-8")
+        uri = f"cog://mem/overflow/{filename}"
+
+        # Best-effort Tier 2 pointer append. A one-line summary keeps the
+        # index scannable; pipes are stripped so the table row stays valid.
+        try:
+            index = get_tier2_index_path()
+            if index.exists():
+                first_line = content.strip().splitlines()[0] if content.strip() else ""
+                summary = first_line.replace("|", "/")[:60]
+                row = (
+                    f"| {summary} | {uri} | {date} "
+                    f"| memory-overflow,hermes-evicted,{target} |\n"
+                )
+                with open(index, "a", encoding="utf-8") as f:
+                    f.write(row)
+        except (OSError, IOError):
+            logger.warning("Tier 2 index append failed for %s (eviction kept)", uri)
+
+        return uri
+
+    def _evict_oldest_to_substrate(self, target: str) -> bool:
+        """Evict the oldest Tier 1 entry to the substrate. Returns success.
+
+        The entry is only removed from Tier 1 after the cogdoc write
+        succeeds — a failed substrate write must never lose the entry.
+        After a successful eviction the store is persisted immediately, so
+        the on-disk file never resurrects an entry that already has a
+        substrate cogdoc. All failures are silent (logged, never raised):
+        the caller falls back to the ordinary capacity error path.
+        """
+        entries = self._entries_for(target)
+        if not entries:
+            return False
+
+        oldest = entries[0]
+        try:
+            uri = self._write_cogdoc_to_substrate(oldest, target)
+        except Exception as e:  # noqa: BLE001 — silent by design (MEMDUMP-001)
+            logger.warning("Memory eviction failed for target=%s: %s", target, e)
+            return False
+        if not uri:
+            return False
+
+        entries.pop(0)
+        self._set_entries(target, entries)
+        try:
+            self.save_to_disk(target)
+        except Exception as e:  # noqa: BLE001 — entry is already in substrate
+            logger.warning("Post-eviction persist failed for target=%s: %s", target, e)
+        logger.info("Evicted oldest %s entry to %s", target, uri)
+        return True
+
+    def scan_tier2_index_for_hot_entries(self) -> List[str]:
+        """Return cog:// URIs of Tier 2 index rows tagged 'hot'.
+
+        Parses the index's markdown table; rows whose tags cell contains the
+        token 'hot' (comma-separated, case-insensitive) are returned in file
+        order. Missing or malformed index yields an empty list — this is a
+        read-side convenience and must never raise.
+        """
+        index = get_tier2_index_path()
+        if not index.exists():
+            return []
+        try:
+            raw = index.read_text(encoding="utf-8")
+        except (OSError, IOError):
+            return []
+
+        hot: List[str] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) < 4:
+                continue
+            uri, tags = cells[1], cells[3]
+            tag_tokens = {t.strip().lower() for t in tags.split(",")}
+            if "hot" in tag_tokens and uri:
+                hot.append(uri)
+        return hot
 
     # -- Internal helpers --
 

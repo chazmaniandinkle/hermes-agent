@@ -120,9 +120,19 @@ class TestMemoryStoreAdd:
         assert result["target"] == "user"
 
 
+    def test_add_duplicate_rejected(self, store):
+        store.add("memory", "fact A")
+        result = store.add("memory", "fact A")
+        assert result["success"] is True  # No error, just a note
+        assert len(store.memory_entries) == 1  # Not duplicated
+
     def test_overflow_returns_consolidation_context(self, store):
-        store.add("memory", "x" * 490)
-        result = store.add("memory", "this will exceed the limit")
+        # A single entry larger than the whole limit can never fit -- this
+        # stays a hard error. The old fill-then-add case is now absorbed by
+        # silent eviction (see tests/tools/test_memory_tool_eviction.py), so
+        # the consolidation-context contract is asserted on the preserved
+        # hard-error path.
+        result = store.add("memory", "x" * 600)
         assert result["success"] is False
         assert "exceed" in result["error"].lower()
         # Overflow response gives the model what it needs to consolidate in-turn
@@ -131,6 +141,7 @@ class TestMemoryStoreAdd:
         assert "retry" in result["error"].lower()
 
         # A replace that blows the budget mirrors the add-overflow shape.
+        store.add("memory", "x" * 490)
         result = store.replace("memory", "x" * 490, "y" * 600)
         assert result["success"] is False
         assert "current_entries" in result
