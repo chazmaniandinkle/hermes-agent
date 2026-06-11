@@ -7393,7 +7393,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
     async def _bounded_adapter_teardown(
-        self, adapter, platform, *, profile: Optional[str] = None
+        self, adapter, platform, *, profile: Optional[str] = None,
+        grace_seconds: float = 0.0,
     ) -> None:
         """Tear down one adapter on the shutdown path with bounded awaits.
 
@@ -7409,13 +7410,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task is cancelled and detached, then teardown forces forward progress;
         the loop never hangs even if an adapter swallows cancellation. Never
         raises.
+
+        ``grace_seconds`` is forwarded to ``adapter.cancel_background_tasks()``
+        (PATCH-010): on a planned restart it gives an in-flight send (e.g. the
+        `/restart` ack the handler just queued, ~50ms before teardown reaches
+        here) a moment to flush before cancellation, rather than being cut off
+        mid-send. Zero on a plain shutdown — no behavior change there.
         """
         timeout = self._adapter_disconnect_timeout_secs()
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
         try:
             cancelled = await self._await_adapter_cleanup_with_timeout(
-                adapter.cancel_background_tasks(), timeout
+                adapter.cancel_background_tasks(grace_seconds=grace_seconds), timeout
             )
             if not cancelled:
                 logger.warning(
@@ -14659,14 +14666,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if cancel_completion_batches is not None:
                 await cancel_completion_batches()
 
+            # On a planned restart, give in-flight sends a moment to flush so
+            # the /restart ack the handler just queued isn't cancelled
+            # mid-send (it starts ~50ms before teardown reaches here — far
+            # less than one HTTPS round trip). Zero grace on a plain
+            # shutdown — no behavior change there. (PATCH-010)
+            _teardown_grace = 2.0 if self._restart_requested else 0.0
+
             for platform, adapter in list(self.adapters.items()):
-                await self._bounded_adapter_teardown(adapter, platform)
+                await self._bounded_adapter_teardown(
+                    adapter, platform, grace_seconds=_teardown_grace
+                )
 
             # Disconnect secondary-profile adapters (multiplex mode).
             for _prof, _amap in list(getattr(self, "_profile_adapters", {}).items()):
                 for platform, adapter in list(_amap.items()):
                     await self._bounded_adapter_teardown(
-                        adapter, platform, profile=_prof
+                        adapter, platform, profile=_prof,
+                        grace_seconds=_teardown_grace,
                     )
                 _amap.clear()
             if hasattr(self, "_profile_adapters"):
