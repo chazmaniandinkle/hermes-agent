@@ -4517,9 +4517,20 @@ class BasePlatformAdapter(ABC):
         if session_key not in self._active_sessions:
             self._session_tasks.pop(session_key, None)
 
-    async def cancel_background_tasks(self) -> None:
+    async def cancel_background_tasks(self, grace_seconds: float = 0.0) -> None:
         """Cancel in-flight background tasks (shutdown/replacement); 5s bound each,
-        stragglers are untracked and left to unwind."""
+        stragglers are untracked and left to unwind.
+
+        ``grace_seconds`` (restart-ack-teardown-race) lets in-flight tasks finish naturally
+        before cancellation; the planned-restart path passes a small grace so the /restart
+        ack isn't cancelled mid-send. Tasks still pending afterwards are cancelled as usual."""
+        if grace_seconds > 0:
+            pending = [t for t in self._background_tasks if not t.done()]
+            if pending:
+                _done, still_pending = await asyncio.wait(pending, timeout=grace_seconds)
+                if still_pending:
+                    logger.debug("[%s] %d background task(s) still pending after %.1fs grace; cancelling",
+                                 self.name, len(still_pending), grace_seconds)
         # Re-drain (max 5 rounds): a message arriving mid-gather spawns a task clear() would
         # untrack.
         for _ in range(5):

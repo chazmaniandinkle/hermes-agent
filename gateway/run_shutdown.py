@@ -1891,13 +1891,17 @@ class GatewayShutdownMixin:
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
         if cancel_completion_batches is not None:
             await cancel_completion_batches()
+        # restart-ack-teardown-race: on a planned restart give in-flight sends (the /restart ack
+        # queued ~50ms before teardown) a moment to flush; zero grace on a plain shutdown.
+        _teardown_grace = 2.0 if getattr(self, "_restart_requested", False) else 0.0
         for platform, adapter in list(self.adapters.items()):
-            await self._bounded_adapter_teardown(adapter, platform)
+            await self._bounded_adapter_teardown(adapter, platform, grace_seconds=_teardown_grace)
         # Disconnect secondary-profile adapters (multiplex mode).
         _profile_adapters = getattr(self, "_profile_adapters", {})
         for _prof, _amap in list(_profile_adapters.items()):
             for platform, adapter in list(_amap.items()):
-                await self._bounded_adapter_teardown(adapter, platform, profile=_prof)
+                await self._bounded_adapter_teardown(adapter, platform, profile=_prof,
+                                                     grace_seconds=_teardown_grace)
             _amap.clear()
         _profile_adapters.clear()
         logger.info("Shutdown phase: all adapters disconnected at +%.2fs", ctx.elapsed())

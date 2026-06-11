@@ -90,19 +90,26 @@ class GatewayAdapterLifecycleMixin:
                     timeout, label,
                 )
 
-    async def _bounded_adapter_teardown(self, adapter, platform, *, profile: Optional[str] = None) -> None:
+    async def _bounded_adapter_teardown(self, adapter, platform, *, profile: Optional[str] = None,
+                                        grace_seconds: float = 0.0) -> None:
         """Tear down one adapter on the shutdown path with bounded awaits (never raises). Unbounded,
         a half-dead transport stalls past systemd's ``TimeoutStopSec``; the SIGKILL skips ``atexit``
         PID-file cleanup and the next start dies with "PID file race lost".
 
         Both ``cancel_background_tasks()`` and ``disconnect()`` can block indefinitely when a platform's
         network state is half-dead (e.g. a wedged Feishu/Lark WebSocket thread waiting on I/O). See #14128.
+
+        ``grace_seconds`` (restart-ack-teardown-race) is forwarded to ``cancel_background_tasks()``
+        only when > 0, so the plain-shutdown path keeps upstream's zero-arg call shape exactly
+        (upstream tests mock it as a zero-arg callable). On a planned restart it lets the /restart
+        ack the handler just queued finish sending instead of being cancelled mid-send.
         """
+        _cancel_kwargs = {"grace_seconds": grace_seconds} if grace_seconds > 0 else {}
         timeout = self._adapter_disconnect_timeout_secs()
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
         try:
-            if not await self._await_adapter_cleanup_with_timeout(adapter.cancel_background_tasks(), timeout):
+            if not await self._await_adapter_cleanup_with_timeout(adapter.cancel_background_tasks(**_cancel_kwargs), timeout):
                 logger.warning(
                     "✗ %s background-task cancel timed out after %.1fs - forcing continue%s",
                     platform.value, timeout, suffix,

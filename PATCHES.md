@@ -35,24 +35,22 @@ This node runs **one gateway process per agent profile**, each a separate launch
 ## At-Risk Patches (vendored-repo modifications — clobbered by `git reset`, replayed by rebase)
 
 ### PATCH-001: Progressive memory eviction (`tools/memory_tool.py`)
-- **Status:** STASHED (`stash@{0}`) — not yet on `local`.
-- **Files:** `tools/memory_tool.py`, `tests/tools/test_memory_tool.py` (+209)
-- **What:** Silent Tier 1→Tier 3 eviction at >75% capacity; evicted entries → CogOS cogdocs; Tier 2 pointer index.
+- **Status:** LIVE on `local` (landed 2026-06-10, `feat(memory): silent Tier 1→Tier 3 eviction…`; closes incident MEMDUMP-001 / task t_4f9f0fc7 — operator decision 2026-06-10). Reimplemented against the eviction test suite; the original draft in `stash@{0}` is now redundant — verify and drop.
+- **Files:** `tools/memory_tool.py` (+175), `tests/tools/test_memory_tool.py` (legacy limit test repointed at the preserved hard-error path), `tests/tools/test_memory_tool_eviction.py` (now tracked).
+- **What:** Silent Tier 1→Tier 3 eviction at >75% capacity; evicted entries → CogOS cogdocs (substrate overflow dir, fallback `~/.hermes/memories/hermes-overflow`); Tier 2 pointer index; `scan_tier2_index_for_hot_entries()` read-side helper. Entry larger than the whole limit stays a hard error.
 - **Risk:** HIGH — core file, likely upstream churn.
 - **Path to safety:** Upstream PR, or move to a plugin hook.
 
 ### PATCH-002: Untracked test files
-- **Status:** UNTRACKED.
-- **Files:** `tests/plugins/test_skill_relevance_gate.py`, `tests/tools/test_memory_tool_eviction.py`
+- **Status:** PARTIALLY RESOLVED — `test_memory_tool_eviction.py` committed with PATCH-001 (2026-06-10). Still untracked: `tests/plugins/test_skill_relevance_gate.py`, `skills/devops/kanban-closed-loop-supervisor/`.
+- **Files:** `tests/plugins/test_skill_relevance_gate.py`
 - **Risk:** LOW. **Path to safety:** commit on `local`, or move to `~/.hermes/plugins/skill_relevance_gate/tests/`.
 
-### PATCH-003: launchd `/restart` detection (`gateway/run.py`)
-- **Status:** LIVE & VERIFIED on `local` (commit `f54c2854e`; gateway runs from `local` as of 2026-06-03). Confirmed end-to-end: Telegram `/restart` exits 75 → launchd relaunches automatically. PENDING upstream merge of **PR #33393**.
-- **Files:** `gateway/run.py` (+2/-1)
-- **What:** Adds `_under_launchd = bool(os.environ.get("XPC_SERVICE_NAME"))` to `_handle_restart_command` so macOS `/restart` uses `via_service=True` (exit 75) and launchd's `KeepAlive{SuccessfulExit=false}` relaunches it. Without it, `/restart` exits 0 and the gateway stays down.
-- **Upstream:** PR https://github.com/NousResearch/hermes-agent/pull/33393 (OPEN, unmerged); issues #37388 (P1), #29180, #38053.
-- **Risk:** LOW (2-line) but HIGH-churn file.
-- **Reconciler action:** when PR #33393 merges → drop on next rebase. If closed-unmerged → re-home (other launchd-restart PRs: #37094, #37508).
+### PATCH-003: launchd `/restart` detection (now `gateway/slash_commands.py`)
+- **Status:** RE-APPLIED 2026-06-10 (same night as the rebase that dropped it). The "superseded by upstream" call was **wrong**: upstream's `darwin` check at the exit-code site (`run.py:5957`) only runs when `via_service=True`, but the `/restart` handler's service detection (refactored into `gateway/slash_commands.py` `_handle_restart_command`) checks only `INVOCATION_ID` (systemd) + container markers — under launchd it takes the `detached=True, via_service=False` branch → clean exit 0 → `KeepAlive{SuccessfulExit=false}` never relaunches. **Bit live 2026-06-10 20:46 EDT:** a Telegram `/restart` left the cog gateway dead for ~25 min. Lesson reconfirmed: clean reapply / "upstream has a launchd mention" ≠ superseded — trace the actual call path.
+- **Is:** `_under_service = bool(INVOCATION_ID) or XPC_SERVICE_NAME not in ("", "0")` in `gateway/slash_commands.py` (`_handle_restart_command`). The `"0"` exclusion is new vs the original PATCH-003: interactive macOS shells inherit `XPC_SERVICE_NAME=0` (truthy string), which would misroute non-service runs to exit-75-with-no-reviver. launchd jobs get the real label (verified: `XPC_SERVICE_NAME=ai.hermes.gateway-darkstar` via `ps eww`).
+- **Upstream:** **PR #43888 OPEN** (filed 2026-06-10, fixes #43475; supersedes the #19940/#33393 probe family — stale location + bare-bool `=0` hazard — and avoids the double-spawn risk in the exit-code-site PRs #43498/#43596). Pointer comments left on #43475 and #33393.
+- **Reconciler action:** track PR #43888; when it (or an equivalent handler-branch launchd check) merges, this patch drops out at rebase. Until then re-apply on every rebase — do NOT mark superseded again without tracing the handler call path.
 
 ### PATCH-004: Myrgic overlay header in `AGENTS.md`
 - **Status:** ON `local` (this commit).
@@ -110,17 +108,32 @@ This node runs **one gateway process per agent profile**, each a separate launch
 
 ---
 
+### PATCH-010: /restart ack lost to teardown race (`gateway/platforms/base.py`, `gateway/run.py`)
+- **Status:** ON `local` (this commit). **Live after each gateway restart.**
+- **Files:** `gateway/platforms/base.py` (`cancel_background_tasks` gains `grace_seconds=0.0`), `gateway/run.py` (`_stop_impl` passes `grace_seconds=2.0 if self._restart_requested else 0.0`), `tests/gateway/test_restart_ack_grace.py` (new, 3 tests).
+- **What:** The `/restart` handler queues its ack ("♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console…") and `request_restart` begins `stop()` 50ms later. With no active agents the drain phase is instant, and `cancel_background_tasks()` cancelled the in-flight `_process_message_background` task mid-HTTPS-send — `CancelledError` propagates silently (no failure log, no retry), so the ack never reached the chat. Observed 3/3 on 2026-06-10 (20:46, 21:38, 21:39): "Sending response (119 chars)" logged, stop 52ms later, no delivery. The fix gives in-flight tasks a bounded grace window (2s, restart path only) to finish naturally before cancellation; plain stops are unchanged.
+- **Why it matters beyond cosmetics:** the ack's text is the recovery instruction for the PATCH-003 failure mode — the race ate the one message telling the operator what to do when the gateway bricks.
+- **Upstream:** strong PR candidate (companion to #43888); no Myrgic specificity.
+- **Risk:** LOW — additive default-off parameter; only the planned-restart path changes timing (≤2s slower teardown when a send is in flight).
+- **Reconciler action:** watch `cancel_background_tasks` and the `_stop_impl` adapter-teardown loop for churn; drop if upstream adds an equivalent flush-before-cancel.
+
+---
+
 ## Files to Watch (upstream changes here may break a patch or plugin)
 
 | File | Why | Affected |
 |------|-----|----------|
 | `tools/memory_tool.py` | PATCH-001 | PATCH-001 |
-| `gateway/run.py` | `_handle_restart_command` launchd detect; startup/shutdown hooks | PATCH-003, EXT-002, EXT-003 |
+| `gateway/run.py` | startup/shutdown hooks; exit-code site `via_service` logic pairs with PATCH-003 | EXT-002, EXT-003, PATCH-003 |
+| `gateway/slash_commands.py` | `_handle_restart_command` service-manager detection | PATCH-003 |
 | `AGENTS.md` | First lines (overlay anchor) | PATCH-004 |
 | `tools/tts_tool.py` | TTS output path naming | PATCH-006 |
-| `agent/anthropic_adapter.py` | Monkeypatched by oauth_billing_gate; `_refresh_oauth_token`/`_write_claude_code_credentials` read-only | EXT-001, PATCH-008 |
+| `agent/anthropic_adapter.py` | oauth_billing_gate wraps `build_anthropic_kwargs` + forces `_MCP_TOOL_PREFIX=""`; `_refresh_oauth_token`/`_write_claude_code_credentials` read-only | EXT-001, PATCH-008 |
+| `agent/agent_runtime_helpers.py` | oauth_billing_gate wraps `repair_tool_call` (inbound `mcp__`→registered-name reversal) | EXT-001 |
+| `agent/transports/anthropic.py` | oauth_billing_gate wraps `normalize_response` (inbound `mcp__` reversal) | EXT-001 |
 | `agent/credential_pool.py` | `_refresh_entry` claude_code read-only branch | PATCH-007, EXT-010 |
 | `ui-tui/src/app/slash/commands/core.ts` | `/steer` carries `aliases: ['s']` | PATCH-009 |
+| `gateway/platforms/base.py` | `cancel_background_tasks` grace window | PATCH-010 |
 | `gateway/platforms/discord/adapter.py` | Discord voice | EXT-003 |
 | `hermes_cli/plugins.py` | Plugin loading | all EXT-* |
 
@@ -142,3 +155,8 @@ Full detail: `~/.hermes/journals/hermes-patch-registry.md`.
 | 2026-06-03 | Added | PATCH-004 | AGENTS.md Myrgic overlay header |
 | 2026-06-03 | Added | PATCH-006 | TTS concurrent output path collision (microsecond timestamp). PATCH-005 (voice chunk pipelining) attempted same session, scrapped — did not fix the gap. |
 | 2026-06-04 | Added | PATCH-009 | `/s` alias for the TUI `/steer` slash command (`ui-tui/src/app/slash/commands/core.ts`). One-line `aliases: ['s']`. Parity tests + build verified. |
+| 2026-06-10 | Landed | PATCH-001 | Eviction implemented against the test suite and committed to `local` (closes MEMDUMP-001 / t_4f9f0fc7; operator decision 2026-06-10). `stash@{0}` draft now redundant — verify and drop. |
+| 2026-06-10 | Superseded | PATCH-003 | Dropped at rebase onto `origin/main` (upstream restart path handles launchd via `darwin` platform check; XPC probe + PR #33393 obsolete). Verify `/restart` after next gateway restart. |
+| 2026-06-10 | Rebased | All | `local` stack rebased onto `origin/main` (was 272 behind). 11 commits survive; only conflict was PATCH-003 (dropped). Memory + auth/oauth suites green on the rebased base. |
+| 2026-06-10 | Added | PATCH-010 | /restart ack was cancelled mid-send by teardown (50ms handler-to-cancel vs one HTTPS round trip); `cancel_background_tasks` gains a restart-scoped 2s grace. Found while verifying PATCH-003 (operator saw only the post-boot confirmation, never the ack). |
+| 2026-06-10 | Re-applied | PATCH-003 | "Superseded" call was wrong — upstream's launchd handling lives only at the exit-code site, never reached because the `/restart` handler (`gateway/slash_commands.py`) doesn't detect launchd. Regression bit live at 20:46 EDT (cog gateway dead after Telegram `/restart`). Re-applied in the handler with `XPC_SERVICE_NAME not in ("", "0")` (interactive shells inherit `=0`). Upstream PR candidate. |
