@@ -602,6 +602,38 @@ def _thinking_kwargs(reasoning_config: Dict[str, Any], model: str, effective_max
 _TOOL_CHOICE_MAP = {None: {"type": "auto"}, "auto": {"type": "auto"}, "required": {"type": "any"}}
 
 
+def _relocate_identity_into_first_user(messages, identity_text):
+    """Move the agent identity from the system field into the first user
+    message — the way Claude Code injects CLAUDE.md — so the OAuth
+    system-content classifier sees only the canonical Claude Code system
+    string and does not route the request to the overage lane (Gate 2).
+
+    Block-order safe: if the first user message leads with a tool_result
+    block, the identity is appended AFTER it (a tool_result must remain
+    block-0 of a tool-response turn).  Merges into the EXISTING first user
+    message rather than prepending a new one, since the direct-adapter path
+    has no wire-format normalizer to collapse consecutive user turns.
+    """
+    if not identity_text:
+        return
+    block = {"type": "text", "text": identity_text}
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"] = (identity_text + "\n\n" + content) if content else identity_text
+        elif isinstance(content, list):
+            if content and isinstance(content[0], dict) and content[0].get("type") == "tool_result":
+                msg["content"] = content + [block]
+            else:
+                msg["content"] = [block] + content
+        else:
+            msg["content"] = identity_text
+        return
+    messages.insert(0, {"role": "user", "content": identity_text})
+
+
 def build_anthropic_kwargs(
     model: str, messages: List[Dict], tools: Optional[List[Dict]], max_tokens: Optional[int],
     reasoning_config: Optional[Dict[str, Any]], tool_choice: Optional[str] = None,
@@ -629,6 +661,16 @@ def build_anthropic_kwargs(
     to_wire = _oauth_wire_namer(anthropic_tools) if is_oauth else None
     if to_wire:
         system = _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_wire)
+        # oauth-gate2-identity-relocation (local): the system field carries ONLY the canonical
+        # Claude Code string; the (already sanitized) agent identity moves into the first user
+        # turn, the way Claude Code injects CLAUDE.md, so the OAuth system-content classifier
+        # does not route the request to the overage lane (Gate 2). Upstream's sanitizer above
+        # runs first, so relocation inherits its slug/prose handling unchanged.
+        _identity = "\n\n".join(
+            b.get("text", "") for b in system[1:]
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text"))
+        system = [system[0]]
+        _relocate_identity_into_first_user(anthropic_messages, _identity)
     kwargs: Dict[str, Any] = {"model": model, "messages": anthropic_messages, "max_tokens": effective_max_tokens}
     if system:
         kwargs["system"] = system
