@@ -2527,6 +2527,12 @@ class TestAuxiliaryAuthRefreshRetry:
 
 
     def test_refresh_provider_credentials_force_refreshes_anthropic_oauth_and_evicts_cache(self, monkeypatch):
+        # PATCH-008: the claude_code OAuth refresh path is READ-ONLY. Hermes
+        # never POSTs the single-use refresh token and never writes
+        # ~/.claude/.credentials.json — it delegates to the owner via the
+        # user-space actuator, then re-reads keychain-first. Assert the
+        # read-only contract (POST/write sentinels) instead of the historical
+        # POST-based flow.
         stale_client = MagicMock()
         cache_key = ("anthropic", False, None, None, None)
 
@@ -2534,26 +2540,48 @@ class TestAuxiliaryAuthRefreshRetry:
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "")
 
-        with (
-            patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "claude-haiku-4-5-20251001", None)}),
-            patch("agent.anthropic_adapter.read_claude_code_credentials", return_value={
+        # Three reads happen along this path, all still-expired except the
+        # last: (1) _refresh_provider_credentials's own probe read, (2)
+        # _refresh_oauth_token's adopt-already-refreshed-token fast-path
+        # probe, (3) _refresh_oauth_token's post-actuator re-read, which
+        # picks up the owner-refreshed token.
+        reads = iter([
+            {
                 "accessToken": "expired-token",
                 "refreshToken": "refresh-token",
                 "expiresAt": 0,
-            }),
-            patch("agent.anthropic_adapter.refresh_anthropic_oauth_pure", return_value={
-                "access_token": "fresh-token",
-                "refresh_token": "refresh-token-2",
-                "expires_at_ms": 9999999999999,
-            }) as mock_refresh_oauth,
-            patch("agent.anthropic_adapter._write_claude_code_credentials") as mock_write,
+            },
+            {
+                "accessToken": "expired-token",
+                "refreshToken": "refresh-token",
+                "expiresAt": 0,
+            },
+            {
+                "accessToken": "fresh-token",
+                "refreshToken": "refresh-token-2",
+                "expiresAt": 9999999999999,
+            },
+        ])
+
+        with (
+            patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "claude-haiku-4-5-20251001", None)}),
+            patch("agent.anthropic_adapter.read_claude_code_credentials", side_effect=lambda: next(reads)),
+            patch("agent.anthropic_adapter.subprocess.run") as mock_run,
+            patch(
+                "agent.anthropic_adapter.refresh_anthropic_oauth_pure",
+                side_effect=AssertionError("must not POST the refresh token"),
+            ),
+            patch(
+                "agent.anthropic_adapter._write_claude_code_credentials",
+                side_effect=AssertionError("must not write CC's credential file"),
+            ) as mock_write,
         ):
             from agent.auxiliary_client import _refresh_provider_credentials
 
             assert _refresh_provider_credentials("anthropic") is True
 
-        mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
-        mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
+        mock_run.assert_called_once()
+        mock_write.assert_not_called()
         stale_client.close.assert_called_once()
 
     def test_refresh_provider_credentials_remints_vertex_token_and_evicts_cache(self):

@@ -1191,26 +1191,33 @@ def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) 
 
 
 def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
-    """Attempt to refresh an expired Claude Code OAuth token.
+    """Refresh an expired Claude Code OAuth token — READ-ONLY (PATCH-008).
 
-    Claude Code's OAuth refresh tokens are single-use: a successful refresh
-    rotates the pair and invalidates the old refresh token. Claude Code itself
-    also refreshes on its own schedule (IDE/CLI activity), so by the time
-    Hermes notices an expired token, Claude Code may have already rotated it.
-    POSTing our now-stale refresh token in that window races Claude Code and
-    fails with ``invalid_grant``.
+    Claude Code is the sole owner/writer of its OAuth credential (the macOS
+    keychain entry "Claude Code-credentials" and the ~/.claude/.credentials.json
+    mirror). Hermes must NEVER POST that single-use refresh token (it races
+    Claude Code) and must NEVER write the credential file (CC >=2.1.114 reads
+    the keychain first, so a Hermes file write only poisons CC's *fallback*
+    store with a token CC didn't issue → forced manual `claude /login`).
 
-    So before refreshing, re-read the live credential sources. If Claude Code
-    has already produced a valid token, adopt it and skip the POST entirely.
-    Only fall back to refreshing ourselves when no fresh credential is found.
+    Fast path (upstream, 1dde7e2f2/5a5396aec): Claude Code itself refreshes on
+    its own schedule (IDE/CLI activity), so by the time Hermes notices an
+    expired token, Claude Code may have already rotated it. Re-read the live
+    credential sources first; if Claude Code has already produced a valid,
+    DIFFERENT token with a real future expiry, adopt it — strictly better than
+    any refresh path, free, no subprocess. (A 0/absent ``expiresAt`` means
+    "managed key / unknown expiry" — see ``is_claude_code_token_valid`` — and
+    must NOT be treated as a fresh refresh.)
+
+    Fallback (PATCH-008, local — no upstream equivalent): when the re-read
+    finds nothing fresher, upstream's own body still POSTs the refresh token
+    and writes the credential file directly. That reintroduces the exact race
+    PATCH-007/008 exist to kill. Instead, delegate the refresh to the OWNER
+    via the user-space actuator (a headless `claude -p`, single-flight), then
+    re-read keychain-first. Never POST, never write the file.
     """
     # Claude Code may have already refreshed — adopt its token rather than
-    # racing it with our (possibly already-rotated) refresh token. Only adopt
-    # when the live re-read produced a DIFFERENT token with a real future
-    # expiry: re-adopting the same credential we were just handed would be a
-    # no-op, and a 0/absent ``expiresAt`` means "managed key / unknown expiry"
-    # (see is_claude_code_token_valid) which must NOT be treated as a fresh
-    # refresh here.
+    # racing it with our (possibly already-rotated) refresh token.
     current = read_claude_code_credentials()
     if current:
         current_token = current.get("accessToken", "")
@@ -1224,23 +1231,33 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
             logger.debug("Adopted Claude Code's already-refreshed OAuth token")
             return current_token
 
-    refresh_token = (current or {}).get("refreshToken", "") or creds.get("refreshToken", "")
-    if not refresh_token:
+    if not (current or {}).get("refreshToken", "") and not creds.get("refreshToken", ""):
         logger.debug("No refresh token available — cannot refresh")
         return None
 
-    try:
-        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
-        _write_claude_code_credentials(
-            refreshed["access_token"],
-            refreshed["refresh_token"],
-            refreshed["expires_at_ms"],
-        )
-        logger.debug("Successfully refreshed Claude Code OAuth token")
-        return refreshed["access_token"]
-    except Exception as e:
-        logger.debug("Failed to refresh Claude Code token: %s", e)
-        return None
+    # --- PATCH-008 (local): delegate to the owner, never POST/write ---------
+    actuator = os.path.expanduser("~/.hermes/bin/claude-token-refresh")
+    if os.path.exists(actuator):
+        try:
+            subprocess.run(
+                [actuator], timeout=45,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            logger.debug("claude_code refresh actuator failed: %s", exc)
+
+    # Re-read keychain-first. Do NOT POST the refresh token; do NOT write the
+    # credential file. If the owner refreshed, adopt the fresh keychain token.
+    fresh = read_claude_code_credentials()
+    if fresh and is_claude_code_token_valid(fresh):
+        logger.debug("Adopted owner-refreshed Claude Code keychain token (read-only)")
+        return fresh["accessToken"]
+
+    logger.debug("Claude Code credential still stale after owner refresh; needs `claude /login`")
+    return None
+    # --- end PATCH-008 -------------------------------------------------------
 
 
 def _write_claude_code_credentials(
@@ -1250,65 +1267,19 @@ def _write_claude_code_credentials(
     *,
     scopes: Optional[list] = None,
 ) -> None:
-    """Write refreshed credentials back to ~/.claude/.credentials.json.
+    """NO-OP (PATCH-008): Hermes never writes Claude Code's credential file.
 
-    The optional *scopes* list (e.g. ``["user:inference", "user:profile", ...]``)
-    is persisted so that Claude Code's own auth check recognises the credential
-    as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
-    in the stored scopes before it will use the token.
+    ``~/.claude/.credentials.json`` is owned by Claude Code, which reads the
+    macOS keychain first (>=2.1.114) and treats this file only as a fallback.
+    Any Hermes write here lands a token CC did not issue into that fallback,
+    which CC then loads on a keychain-read miss → ``OAuth token revoked ·
+    Please run /login``. Hermes is a strict read-only mirror of the Claude
+    Code credential: it delegates refresh to the owner via the actuator (see
+    ``_refresh_oauth_token``) and never writes the file. Kept as a no-op so
+    the remaining (PATCH-007-dead) call sites in credential_pool stay
+    import-safe. See PATCHES.md PATCH-008.
     """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
-    try:
-        # Read existing file to preserve other fields
-        existing = {}
-        if cred_path.exists():
-            existing = json.loads(cred_path.read_text(encoding="utf-8"))
-
-        oauth_data: Dict[str, Any] = {
-            "accessToken": access_token,
-            "refreshToken": refresh_token,
-            "expiresAt": expires_at_ms,
-        }
-        if scopes is not None:
-            oauth_data["scopes"] = scopes
-        elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
-            # Preserve previously-stored scopes when the refresh response
-            # does not include a scope field.
-            oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
-
-        existing["claudeAiOauth"] = oauth_data
-
-        cred_path.parent.mkdir(parents=True, exist_ok=True)
-        # Per-process random suffix avoids collisions between concurrent
-        # writers and stale leftovers from a prior crashed write.
-        _tmp_cred = cred_path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
-        try:
-            # Create the temp file atomically at 0o600. The previous
-            # write_text + post-replace chmod opened a TOCTOU window where
-            # both the temp file and the destination briefly inherited the
-            # process umask (commonly 0o644 = world-readable), exposing
-            # Claude Code OAuth tokens to other local users between create
-            # and chmod. Mirrors agent/google_oauth.py (#19673) and
-            # tools/mcp_oauth.py (#21148). Parent dir (~/.claude/) is
-            # owned by Claude Code itself, so we leave its mode alone.
-            fd = os.open(
-                str(_tmp_cred),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                stat.S_IRUSR | stat.S_IWUSR,
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(existing, fh, indent=2)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(_tmp_cred, cred_path)
-        except OSError:
-            try:
-                _tmp_cred.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-    except (OSError, IOError) as e:
-        logger.debug("Failed to write refreshed credentials: %s", e)
+    return None
 
 
 def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:

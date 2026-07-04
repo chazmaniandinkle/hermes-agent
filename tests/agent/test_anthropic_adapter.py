@@ -407,96 +407,107 @@ class TestRefreshOauthToken:
         creds = {"accessToken": "expired", "refreshToken": "", "expiresAt": 0}
         assert _refresh_oauth_token(creds) is None
 
-    def test_successful_refresh(self, tmp_path, monkeypatch):
+    def test_adopts_already_refreshed_keychain_token_without_actuator(self, tmp_path, monkeypatch):
+        # Upstream fast path (1dde7e2f2): if the live re-read already shows a
+        # DIFFERENT, valid, future-expiry token, adopt it — no actuator call,
+        # no POST at all.
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        monkeypatch.setattr(
-            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
-        )
-
         creds = {
             "accessToken": "old-token",
             "refreshToken": "refresh-123",
             "expiresAt": int(time.time() * 1000) - 3600_000,
         }
-
-        mock_response = json.dumps({
-            "access_token": "new-token-abc",
-            "refresh_token": "new-refresh-456",
-            "expires_in": 7200,
-        }).encode()
-
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_ctx = MagicMock()
-            mock_ctx.__enter__ = MagicMock(return_value=MagicMock(
-                read=MagicMock(return_value=mock_response)
-            ))
-            mock_ctx.__exit__ = MagicMock(return_value=False)
-            mock_urlopen.return_value = mock_ctx
-
+        current = {
+            "accessToken": "already-fresh-from-cc",
+            "refreshToken": "refresh-123",
+            "expiresAt": int(time.time() * 1000) + 3600_000,
+        }
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: current
+        )
+        with patch("agent.anthropic_adapter.subprocess.run") as mock_run, \
+             patch("urllib.request.urlopen", side_effect=AssertionError("must not POST the refresh token")):
             result = _refresh_oauth_token(creds)
+        assert result == "already-fresh-from-cc"
+        mock_run.assert_not_called()
 
-        assert result == "new-token-abc"
-        # Verify credentials were written back
-        cred_file = tmp_path / ".claude" / ".credentials.json"
-        assert cred_file.exists()
-        written = json.loads(cred_file.read_text())
-        assert written["claudeAiOauth"]["accessToken"] == "new-token-abc"
-        assert written["claudeAiOauth"]["refreshToken"] == "new-refresh-456"
+    def test_readonly_adopts_owner_refreshed_keychain_token(self, tmp_path, monkeypatch):
+        # PATCH-008: _refresh_oauth_token is READ-ONLY. It must NOT POST the
+        # single-use refresh token and must NOT write the credential file. It
+        # delegates to the owner via the actuator, then re-reads keychain-first.
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        creds = {
+            "accessToken": "old-token",
+            "refreshToken": "refresh-123",
+            "expiresAt": int(time.time() * 1000) - 3600_000,
+        }
+        # First read (adopt-fast-path probe): nothing fresher yet.
+        # Second read (post-actuator): owner has refreshed.
+        reads = iter([
+            None,
+            {
+                "accessToken": "owner-fresh-token",
+                "refreshToken": "r",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            },
+        ])
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials",
+            lambda: next(reads),
+        )
+        monkeypatch.setattr("agent.anthropic_adapter.subprocess.run", lambda *a, **k: None)
+        with patch("urllib.request.urlopen", side_effect=AssertionError("must not POST the refresh token")):
+            result = _refresh_oauth_token(creds)
+        assert result == "owner-fresh-token"
+
+    def test_readonly_returns_none_when_owner_cannot_refresh(self, tmp_path, monkeypatch):
+        # When the owner cannot produce a fresh token, surface None (caller
+        # falls back / forces interactive login) — still no POST, no write.
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        creds = {"accessToken": "old", "refreshToken": "refresh-123", "expiresAt": 0}
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
+        )
+        monkeypatch.setattr("agent.anthropic_adapter.subprocess.run", lambda *a, **k: None)
+        with patch("urllib.request.urlopen", side_effect=AssertionError("must not POST the refresh token")):
+            assert _refresh_oauth_token(creds) is None
 
     def test_failed_refresh_returns_none(self, tmp_path, monkeypatch):
+        # Same as above under the historical test name — network path must
+        # be unreachable, not merely tolerant of failure.
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr(
             "agent.anthropic_adapter.read_claude_code_credentials", lambda: None
         )
+        monkeypatch.setattr("agent.anthropic_adapter.subprocess.run", lambda *a, **k: None)
         creds = {
             "accessToken": "old",
             "refreshToken": "refresh-123",
             "expiresAt": 0,
         }
-
-        with patch("urllib.request.urlopen", side_effect=Exception("network error")):
+        with patch("urllib.request.urlopen", side_effect=AssertionError("must not POST the refresh token")):
             assert _refresh_oauth_token(creds) is None
 
 
 class TestWriteClaudeCodeCredentials:
-    def test_writes_new_file(self, tmp_path, monkeypatch):
+    # PATCH-008: _write_claude_code_credentials is a no-op — Hermes never writes
+    # Claude Code's credential file. CC owns it; a Hermes write poisons CC's
+    # fallback store with a token CC did not issue → forced `claude /login`.
+    def test_noop_does_not_create_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        _write_claude_code_credentials("tok", "ref", 12345)
+        assert _write_claude_code_credentials("tok", "ref", 12345) is None
         cred_file = tmp_path / ".claude" / ".credentials.json"
-        assert cred_file.exists()
-        data = json.loads(cred_file.read_text())
-        assert data["claudeAiOauth"]["accessToken"] == "tok"
-        assert data["claudeAiOauth"]["refreshToken"] == "ref"
-        assert data["claudeAiOauth"]["expiresAt"] == 12345
+        assert not cred_file.exists(), "no-op WriteBack must not create CC's credential file"
 
-    def test_preserves_existing_fields(self, tmp_path, monkeypatch):
+    def test_noop_does_not_modify_existing_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         cred_dir = tmp_path / ".claude"
         cred_dir.mkdir()
         cred_file = cred_dir / ".credentials.json"
-        cred_file.write_text(json.dumps({"otherField": "keep-me"}))
+        original = json.dumps({"otherField": "keep-me", "claudeAiOauth": {"accessToken": "owned-by-cc"}})
+        cred_file.write_text(original)
         _write_claude_code_credentials("new-tok", "new-ref", 99999)
-        data = json.loads(cred_file.read_text())
-        assert data["otherField"] == "keep-me"
-        assert data["claudeAiOauth"]["accessToken"] == "new-tok"
-
-    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX mode bits not enforced on Windows")
-    def test_credentials_file_created_with_0o600(self, tmp_path, monkeypatch):
-        """Refreshed Claude Code credentials must land on disk at 0o600.
-
-        Regression for the TOCTOU race where ``write_text`` + ``replace``
-        + post-write ``chmod`` left both the temp file and the destination
-        briefly readable at the process umask (commonly 0o644). Mirrors
-        the fix shipped in #19673 (google_oauth) and #21148 (mcp_oauth).
-        """
-        import stat as _stat
-        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
-        _write_claude_code_credentials("tok", "ref", 12345)
-
-        cred_file = tmp_path / ".claude" / ".credentials.json"
-        assert cred_file.exists()
-        mode = _stat.S_IMODE(cred_file.stat().st_mode)
-        assert mode == 0o600, f"creds file mode {oct(mode)} != 0o600 — TOCTOU race regressed"
+        assert cred_file.read_text() == original, "no-op WriteBack must leave CC's file byte-for-byte unchanged"
 
 
 class TestResolveWithRefresh:
