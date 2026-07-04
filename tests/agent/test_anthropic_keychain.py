@@ -231,6 +231,29 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
         result = _refresh_oauth_token({"refreshToken": "stale", "expiresAt": 1})
         assert result == "already-refreshed-token"
 
+    @pytest.mark.xfail(
+        reason=(
+            "LOCAL PATCH-008 (see PATCHES.md): this test asserts the "
+            "pre-PATCH-008 contract -- that _refresh_oauth_token's "
+            "no-fresher-credential fallback POSTs the single-use refresh "
+            "token via refresh_anthropic_oauth_pure and writes the result "
+            "via _write_claude_code_credentials. PATCH-008 deliberately "
+            "replaced that fallback: Hermes must never POST or write Claude "
+            "Code's OAuth credential (races CC's own refresh, see "
+            "PATCH-007/PATCH-008 rationale), so the fallback now delegates "
+            "to the owner via the EXT-010 actuator "
+            "(~/.hermes/bin/claude-token-refresh) and re-reads keychain-first "
+            "-- refresh_anthropic_oauth_pure and _write_claude_code_credentials "
+            "are off this call path entirely. This file has zero diff vs "
+            "upstream/main (never touched by the rebase) and duplicates the "
+            "stale contract; tests/agent/test_anthropic_adapter.py::"
+            "TestRefreshOauthToken::test_readonly_adopts_owner_refreshed_"
+            "keychain_token is the already-updated equivalent asserting the "
+            "actuator-delegation contract. Deliberate divergence, not a "
+            "regression to fix here."
+        ),
+        strict=True,
+    )
     def test_falls_back_to_network_refresh_when_no_fresh_credential(self, monkeypatch):
         """When no live source has a valid token, fall back to refreshing
         ourselves using the freshest available refresh token.
