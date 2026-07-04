@@ -7416,13 +7416,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         `/restart` ack the handler just queued, ~50ms before teardown reaches
         here) a moment to flush before cancellation, rather than being cut off
         mid-send. Zero on a plain shutdown — no behavior change there.
+
+        The kwarg is forwarded only when non-default (>0): on the zero-grace
+        path this calls ``cancel_background_tasks()`` with no arguments at
+        all, matching the pre-PATCH-010 call shape exactly. This keeps the
+        composition with upstream's own bounded-adapter-teardown tests
+        (`tests/gateway/test_bounded_adapter_teardown.py`, unmodified upstream
+        file) intact — those build a bare zero-arg
+        ``AsyncMock(side_effect=lambda: ...)`` for ``cancel_background_tasks``
+        and only exercise the default (plain-shutdown) path.
         """
         timeout = self._adapter_disconnect_timeout_secs()
         suffix = f" (profile: {profile})" if profile else ""
         started_at = time.monotonic()
+        _cancel_kwargs = {"grace_seconds": grace_seconds} if grace_seconds > 0 else {}
         try:
+            _cancel_kwargs = {"grace_seconds": grace_seconds} if grace_seconds > 0 else {}
             cancelled = await self._await_adapter_cleanup_with_timeout(
-                adapter.cancel_background_tasks(grace_seconds=grace_seconds), timeout
+                adapter.cancel_background_tasks(**_cancel_kwargs), timeout
             )
             if not cancelled:
                 logger.warning(
