@@ -4582,6 +4582,103 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
+
+def _defer_cron_job_teardown(do_teardown, *, job_id: str, cron_future=None) -> str:
+    """Run a finished cron job's resource teardown, deferring for an orphaned worker.
+
+    Normal path (*cron_future* is None or already done): ``do_teardown`` runs
+    inline, exactly as the historical ``finally:`` block did. Returns
+    ``"inline"``.
+
+    Orphaned-worker path (PATCH-012): after an inactivity timeout the submitted
+    future is by definition still executing, because
+    ``ThreadPoolExecutor.shutdown(wait=False, cancel_futures=True)`` cannot
+    stop an already-running future. Closing ``session_db`` / ``agent``
+    inline at that point races the worker thread's own message flush
+    (``_flush_messages_to_session_db`` -> ``SessionDB._execute_write``) and
+    silently drops that turn's message row(s); the observable symptom is
+    "Session DB append_message failed: 'NoneType' object has no attribute
+    'execute'". Instead, ownership of the teardown transfers to the future
+    itself via ``add_done_callback``: the close runs on the worker thread
+    the moment ``run_conversation`` actually returns, after its final
+    writes have landed. A daemon ``Timer`` bounds the deferral
+    (``HERMES_CRON_TEARDOWN_HARDCAP`` seconds, default 900) so a worker
+    that never finishes cannot leak the SQLite handle, subprocesses, or
+    httpx sockets forever; if the cap fires first, the residual race window
+    is accepted, and with ``_execute_write``'s closed-connection guard a
+    late write fails as a typed ``RuntimeError`` instead of an opaque
+    ``AttributeError``. Returns ``"deferred"``.
+
+    ``do_teardown(deferred: bool)`` is the caller's closure over the job's
+    resources; ``deferred=True`` on the orphaned-worker path so the caller can
+    skip contracts that only make sense inline (e.g. the deliver-first
+    ``defer_agent_teardown`` hand-back, #58720 — by callback time the
+    delivering caller is long gone, so the agent must be closed here).
+
+    Teardown is idempotent across the two triggers (future completion vs
+    hard cap); whichever fires first wins, the other becomes a no-op.
+    """
+    # Duck-type the future: test doubles (and any future-like without done/
+    # add_done_callback) get the historical inline teardown — with no way to
+    # observe completion, a deferral could never fire.
+    if (
+        cron_future is None
+        or not callable(getattr(cron_future, "done", None))
+        or not callable(getattr(cron_future, "add_done_callback", None))
+        or cron_future.done()
+    ):
+        do_teardown(deferred=False)
+        return "inline"
+
+    _once_lock = threading.Lock()
+    _teardown_ran = [False]
+
+    def _teardown_once(trigger: str) -> None:
+        with _once_lock:
+            if _teardown_ran[0]:
+                return
+            _teardown_ran[0] = True
+        if trigger == "hard-cap":
+            logger.warning(
+                "Job '%s': orphaned worker never completed within the teardown "
+                "hard cap; forcing session-db/agent close now (bounded leak; a "
+                "late write will fail typed instead of dropping silently)",
+                job_id,
+            )
+        do_teardown(deferred=True)
+
+    _raw_cap = os.getenv("HERMES_CRON_TEARDOWN_HARDCAP", "").strip()
+    try:
+        _hard_cap = float(_raw_cap) if _raw_cap else 900.0
+    except (ValueError, TypeError):
+        logger.warning(
+            "Invalid HERMES_CRON_TEARDOWN_HARDCAP=%r; using default 900s",
+            _raw_cap,
+        )
+        _hard_cap = 900.0
+    if _hard_cap <= 0:
+        _hard_cap = 900.0
+
+    _cap_timer = threading.Timer(_hard_cap, _teardown_once, args=("hard-cap",))
+    _cap_timer.daemon = True
+
+    def _on_future_done(_fut) -> None:
+        _cap_timer.cancel()
+        _teardown_once("future-done")
+
+    _cap_timer.start()
+    # If the future completed between the .done() check above and here,
+    # add_done_callback invokes _on_future_done immediately on this thread;
+    # teardown still runs exactly once and the timer is cancelled.
+    cron_future.add_done_callback(_on_future_done)
+    logger.warning(
+        "Job '%s': worker thread still running at teardown; deferring "
+        "session-db/agent close to future completion (hard cap %.0fs)",
+        job_id, _hard_cap,
+    )
+    return "deferred"
+
+
 def run_job(
     job: dict,
     *,
@@ -4589,6 +4686,8 @@ def run_job(
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
+
+
     """
     Execute a single cron job.
 
@@ -4931,6 +5030,10 @@ def run_job(
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    # Future running agent.run_conversation on the cron worker thread.
+    # Pre-bound so the finally: teardown below can consult it safely even
+    # when an exception fires before the executor is created.
+    _cron_future = None
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
@@ -5715,6 +5818,25 @@ def run_job(
                 _cur_tool or "none",
             )
             request_hard_interrupt(agent, "Cron job timed out (inactivity)")
+            # The interrupt flag alone cannot unblock a tool stuck in a
+            # blocking subprocess wait (observed: a git command hung on a
+            # dead SSL connection for 1000s+). Historically the finally:
+            # block's agent.close() did that unblocking as a side effect of
+            # its process_registry.kill_all call, at the cost of also
+            # closing _session_db out from under the still-running worker
+            # thread. Kill this job's registered subprocesses here instead,
+            # so the worker can observe the interrupt and wind down; the
+            # full resource teardown now runs when the worker actually
+            # finishes (see _defer_cron_job_teardown in the finally: block).
+            # (PATCH-012)
+            try:
+                from tools.process_registry import process_registry
+                process_registry.kill_all(task_id=_cron_session_id)
+            except Exception as _kill_exc:
+                logger.debug(
+                    "Job '%s': failed to kill subprocesses after inactivity "
+                    "timeout: %s", job_id, _kill_exc,
+                )
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
@@ -5910,93 +6032,108 @@ def run_job(
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
-        if _session_db:
-            # The agent turn has already returned. Bound every subsequent DB
-            # operation so storage failure cannot hold the dispatch guard.
-            _session_db = _BoundedCronSessionDB(_session_db, job_id)
-            # Compression can rotate the live agent onto a continuation while
-            # this run is in flight. Finalize that continuation, not the stale
-            # cron id captured before AIAgent started. SessionDB is the source
-            # of truth for the lineage; agent.session_id is only a fail-safe
-            # when the lookup itself is unavailable.
-            _final_cron_session_id = _cron_session_id
-            try:
-                _compression_tip = _session_db.get_compression_tip(
-                    _cron_session_id
-                )
-                if _compression_tip:
-                    _final_cron_session_id = _compression_tip
-            except (Exception, KeyboardInterrupt) as e:
+        # Session-db/agent teardown. On the normal path (worker finished, or
+        # it never started) this runs inline, exactly as before. After an
+        # inactivity timeout the submitted future is still executing
+        # (ThreadPoolExecutor.shutdown(wait=False, cancel_futures=True) does
+        # not stop a running future), and closing _session_db / agent here
+        # raced that worker thread's own message flush, dropping the turn's
+        # rows ("Session DB append_message failed: 'NoneType' object has no
+        # attribute 'execute'"). The helper transfers teardown ownership to
+        # the future via add_done_callback, bounded by a hard-cap timer. See
+        # _defer_cron_job_teardown. (PATCH-012)
+        def _do_cron_job_teardown(deferred: bool = False) -> None:
+            if _session_db:
+                # The agent turn has already returned. Bound every subsequent DB
+                # operation so storage failure cannot hold the dispatch guard.
+                sdb = _BoundedCronSessionDB(_session_db, job_id)
+                # Compression can rotate the live agent onto a continuation while
+                # this run is in flight. Finalize that continuation, not the stale
+                # cron id captured before AIAgent started. SessionDB is the source
+                # of truth for the lineage; agent.session_id is only a fail-safe
+                # when the lookup itself is unavailable.
+                _final_cron_session_id = _cron_session_id
                 try:
-                    _agent_session_id = getattr(agent, "session_id", None)
-                    if _agent_session_id:
-                        _final_cron_session_id = _agent_session_id
-                except (Exception, KeyboardInterrupt):
-                    pass
-                logger.debug(
-                    "Job '%s': failed to resolve cron compression tip: %s",
-                    job_id,
-                    e,
-                )
-            # Title the cron session from the job (name -> id) and PERSIST it
-            # BEFORE end_session()/close() tear the connection down, so the
-            # close can never run over an in-flight title write (#50536). The
-            # run-time suffix keeps it unique against the sessions.title index
-            # across runs; _set_cron_session_title dedupes (#50537) and the
-            # except-fallback below guarantees a non-blank title (#50535).
-            try:
-                _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
-                _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
-                if not _set_cron_session_title(
-                    _session_db, _final_cron_session_id, _cron_title
-                ):
-                    # Helper returned None (blank base) -> use the id fallback.
-                    _set_cron_session_title(
-                        _session_db, _final_cron_session_id, f"cron {job_id}"
+                    _compression_tip = sdb.get_compression_tip(
+                        _cron_session_id
                     )
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug(
-                    "Job '%s': failed to set cron session title: %s", job_id, e
-                )
-                # Last-resort: never leave the session blank (#50535). Try the
-                # next free title in the lineage, then a bare id-stamped title.
-                for _fallback in (
-                    getattr(_session_db, "get_next_title_in_lineage", lambda b: b)(
-                        f"cron {job_id}"
-                    ),
-                    f"cron {job_id} {_final_cron_session_id[-6:]}",
-                ):
+                    if _compression_tip:
+                        _final_cron_session_id = _compression_tip
+                except (Exception, KeyboardInterrupt) as e:
                     try:
-                        if _set_cron_session_title(
-                            _session_db, _final_cron_session_id, _fallback
-                        ):
-                            break
+                        _agent_session_id = getattr(agent, "session_id", None)
+                        if _agent_session_id:
+                            _final_cron_session_id = _agent_session_id
                     except (Exception, KeyboardInterrupt):
-                        continue
-            try:
-                _session_db.end_session(
-                    _final_cron_session_id, "cron_complete"
-                )
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to end session: %s", job_id, e)
-            try:
-                _session_db.close()
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
-        # Release subprocesses, terminal sandboxes, browser daemons, and the
-        # main OpenAI/httpx client held by this ephemeral cron agent. Without
-        # this, a gateway that ticks cron every N minutes leaks fds per job
-        # until it hits EMFILE (#10200 / "too many open files").
-        #
-        # When the caller opted to defer teardown (passed a list), hand the live
-        # agent back instead of closing it here — delivery must run against a
-        # live async client, and the caller tears down afterwards (#58720).
-        if defer_agent_teardown is not None:
-            if agent is not None:
-                defer_agent_teardown.append(agent)
-        else:
-            _teardown_cron_agent(agent, job_id)
+                        pass
+                    logger.debug(
+                        "Job '%s': failed to resolve cron compression tip: %s",
+                        job_id,
+                        e,
+                    )
+                # Title the cron session from the job (name -> id) and PERSIST it
+                # BEFORE end_session()/close() tear the connection down, so the
+                # close can never run over an in-flight title write (#50536). The
+                # run-time suffix keeps it unique against the sessions.title index
+                # across runs; _set_cron_session_title dedupes (#50537) and the
+                # except-fallback below guarantees a non-blank title (#50535).
+                try:
+                    _title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+                    _cron_title = f"{_title_base} · {_hermes_now().strftime('%b %d %H:%M')}"
+                    if not _set_cron_session_title(
+                        sdb, _final_cron_session_id, _cron_title
+                    ):
+                        # Helper returned None (blank base) -> use the id fallback.
+                        _set_cron_session_title(
+                            sdb, _final_cron_session_id, f"cron {job_id}"
+                        )
+                except (Exception, KeyboardInterrupt) as e:
+                    logger.debug(
+                        "Job '%s': failed to set cron session title: %s", job_id, e
+                    )
+                    # Last-resort: never leave the session blank (#50535). Try the
+                    # next free title in the lineage, then a bare id-stamped title.
+                    for _fallback in (
+                        getattr(sdb, "get_next_title_in_lineage", lambda b: b)(
+                            f"cron {job_id}"
+                        ),
+                        f"cron {job_id} {_final_cron_session_id[-6:]}",
+                    ):
+                        try:
+                            if _set_cron_session_title(
+                                sdb, _final_cron_session_id, _fallback
+                            ):
+                                break
+                        except (Exception, KeyboardInterrupt):
+                            continue
+                try:
+                    sdb.end_session(
+                        _final_cron_session_id, "cron_complete"
+                    )
+                except (Exception, KeyboardInterrupt) as e:
+                    logger.debug("Job '%s': failed to end session: %s", job_id, e)
+                try:
+                    sdb.close()
+                except (Exception, KeyboardInterrupt) as e:
+                    logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+            # Release subprocesses, terminal sandboxes, browser daemons, and the
+            # main OpenAI/httpx client held by this ephemeral cron agent. Without
+            # this, a gateway that ticks cron every N minutes leaks fds per job
+            # until it hits EMFILE (#10200 / "too many open files").
+            #
+            # When the caller opted to defer teardown (passed a list), hand the live
+            # agent back instead of closing it here — delivery must run against a
+            # live async client, and the caller tears down afterwards (#58720).
+            if not deferred and defer_agent_teardown is not None:
+                if agent is not None:
+                    defer_agent_teardown.append(agent)
+            else:
+                _teardown_cron_agent(agent, job_id)
 
+
+        _defer_cron_job_teardown(
+            _do_cron_job_teardown, job_id=job_id, cron_future=_cron_future,
+        )
 
 def _teardown_cron_agent(
     agent, job_id: str, *, timeout_seconds: Optional[float] = None
