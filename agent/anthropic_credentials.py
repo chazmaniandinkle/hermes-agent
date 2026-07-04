@@ -483,47 +483,25 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
             if not refresh_token:
                 logger.debug("No refresh token available — cannot refresh")
                 return None
-            # Another process may have spent this token and lost the commit; its sidecar verdict is authoritative.
-            if is_rotation_consumed_uncommitted(refresh_token, source_path=cred_path):
-                logger.debug("Refresh token was already consumed by an uncommitted rotation "
-                             "- refusing to replay it; run 'hermes auth add anthropic'")
-                return None
-            fingerprint = hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()[:32]
-            if fingerprint in _DEAD_REFRESH_TOKEN_FINGERPRINTS:
-                logger.debug("Claude Code refresh token was already rejected as terminally invalid - not replaying it")
-                return None
-            try:
-                refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
-            except Exception as e:
-                if is_terminal_anthropic_refresh_error(e):
-                    _DEAD_REFRESH_TOKEN_FINGERPRINTS.add(fingerprint)
-                    logger.warning(
-                        "Claude Code OAuth refresh token is terminally invalid (%s); Hermes cannot use this "
-                        "login. Run 'hermes auth add anthropic' to give Hermes its own login.", e)
-                else:
-                    logger.debug("Failed to refresh Claude Code token: %s", e)
-                return None
-            # The POST spent ``refresh_token``; this write is the commit step. On failure, fail closed and
-            # mark the pre-rotation pair as spent.
-            try:
-                _write_claude_code_credentials(
-                    refreshed["access_token"], refreshed["refresh_token"], refreshed["expires_at_ms"],
-                    spent_refresh_token=refresh_token,
-                )
-            except Exception as e:
-                logger.error(
-                    "Anthropic OAuth refresh rotated the single-use token but could not "
-                    "commit it to %s (%s) — treating the refresh as failed; "
-                    "run 'hermes auth add anthropic' to give Hermes its own login",
-                    cred_path, e,
-                )
-                mark_rotation_consumed_uncommitted(
-                    refresh_token, creds.get("accessToken", ""), current.get("accessToken", ""),
-                    current.get("refreshToken", ""), source_path=cred_path,
-                )
-                return None
-            logger.debug("Successfully refreshed Claude Code OAuth token")
-            return refreshed["access_token"]
+            # --- oauth-credential-read-only-adapter (local): delegate to the owner, never POST/write ---
+            # Claude Code is the sole owner/writer of this single-use credential. Upstream POSTs it
+            # here (and, since #98334, mirrors the rotated pair into the Keychain) — that still races
+            # Claude Code's own refresh. Instead run the user-space actuator (headless `claude -p`,
+            # single-flight) and re-read keychain-first. See PATCHES.md oauth-credential-read-only.
+            actuator = os.path.expanduser("~/.hermes/bin/claude-token-refresh")
+            if os.path.exists(actuator):
+                try:
+                    subprocess.run([actuator], timeout=45, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception as exc:
+                    logger.debug("claude_code refresh actuator failed: %s", exc)
+            fresh = read_claude_code_credentials()
+            if fresh and is_claude_code_token_valid(fresh):
+                logger.debug("Adopted owner-refreshed Claude Code keychain token (read-only)")
+                return fresh["accessToken"]
+            logger.debug("Claude Code credential still stale after owner refresh; needs `claude /login`")
+            return None
+            # --- end oauth-credential-read-only-adapter ---
     except Exception as e:
         # Lock/read failures keep the resolver's fail-soft contract.
         logger.debug("Failed to acquire Claude Code refresh lock: %s", e)
@@ -537,21 +515,10 @@ def _write_claude_code_credentials(
     """Commit refreshed credentials to ~/.claude/.credentials.json; ``CredentialPersistError`` on any failure (a
     corrupt existing file included). *scopes* (or the previously stored scopes) are persisted because Claude Code
     >=2.1.81 gates on ``"user:inference"`` being present."""
-    cred_path = claude_code_credentials_path()
-    try:
-        existing = json.loads(cred_path.read_text(encoding="utf-8")) if cred_path.exists() else {}
-    except (OSError, ValueError) as e:
-        logger.error("Failed to write refreshed credentials to %s: %s", cred_path, e)
-        raise CredentialPersistError(cred_path, e) from e
-    oauth_data: Dict[str, Any] = {"accessToken": access_token, "refreshToken": refresh_token, "expiresAt": expires_at_ms}
-    if scopes is not None:
-        oauth_data["scopes"] = scopes
-    elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
-        oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
-    existing["claudeAiOauth"] = oauth_data
-    _commit_private_json(cred_path, existing, "credentials")
-    _mirror_claude_code_credentials_to_keychain(
-        access_token, refresh_token, expires_at_ms, spent_refresh_token=spent_refresh_token)
+    # oauth-credential-read-only-adapter (local): NO-OP. Hermes never writes Claude Code's
+    # credential (file or Keychain); it is a strict read-only mirror and delegates refresh to the
+    # owner via the actuator. Kept callable so remaining call sites stay import-safe.
+    return None
 
 
 def _merge_keychain_credential_payload(
