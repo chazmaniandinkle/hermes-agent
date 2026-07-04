@@ -4013,6 +4013,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         while True:
             try:
                 with self._lock:
+                    if self._conn is None:
+                        raise RuntimeError(
+                            "SessionDB connection is closed (this SessionDB "
+                            "instance was closed while a concurrent write was "
+                            "in flight — see hermes-agent issue tracking "
+                            "'append_message failed: NoneType' races)"
+                        )
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
                         result = fn(self._conn)
