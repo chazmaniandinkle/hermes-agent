@@ -77,6 +77,10 @@ class TurnFacadeMixin:
         try:
             # First statement of the try so the finally's note_turn_finished balances every exit.
             _review_queue.note_turn_started()
+            # idle-triggered-background-review (local): stamp foreground activity so the idle
+            # scheduler never fires mid-turn and re-debounces on each message. No-op unless enabled.
+            from agent.background_review import note_foreground_turn_start
+            note_foreground_turn_start(self)
             admission = admit_durable_turn_lease(
                 self, session_id=session_id, relay_turn_id=relay_turn_id, task_context=task_context,
                 conversation_history=conversation_history,
@@ -175,6 +179,11 @@ class TurnFacadeMixin:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            try:
+                from agent.background_review import note_foreground_turn_end as _nfte
+                _nfte(self)
+            except Exception:
+                pass
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(relay_turn, outcome=relay_outcome)

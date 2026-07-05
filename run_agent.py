@@ -802,6 +802,20 @@ class AIAgent(
             from agent.review_idle_queue import QUEUE
             QUEUE.enqueue(self, _review_queue_key(self), kwargs)
             return
+        # idle-triggered-background-review (local): when auxiliary.background_review.idle_trigger_seconds
+        # > 0, automatic reviews wait for a session-idle window on ANY provider (upstream's queue above only
+        # covers the managed llama-server). /refine (focus/explicit) always runs now.
+        if focus is None and not explicit:
+            scheduler = None
+            try:
+                from agent.background_review import get_idle_review_scheduler
+                scheduler = get_idle_review_scheduler(self)
+            except Exception:
+                scheduler = None
+            if scheduler is not None:
+                scheduler.schedule(kwargs["messages_snapshot"], review_memory=review_memory,
+                                   review_skills=review_skills)
+                return
         self._spawn_background_review_now(**kwargs)
 
     def _spawn_background_review_now(self, messages_snapshot: List[Dict], review_memory: bool = False,
@@ -944,6 +958,8 @@ class AIAgent(
         """Release LLM clients and child agents WITHOUT tearing down session tool state (gateway cache
         eviction: the session may resume on the same task_id, so processes, sandbox, browser, computer-use and
         memory provider are kept). Idempotent; distinct from ``close()``."""
+        # idle-triggered-background-review (local): drop any scheduled-but-unfired review (idempotent).
+        _quietly(lambda: getattr(self, "_bg_review_scheduler", None) and self._bg_review_scheduler.shutdown(reason="agent cache eviction"))
         self._close_active_children(soft=True)
         # Retire (don't hard-close) the shared client: eviction runs on the gateway memory-manager thread,
         # and a cross-thread close can release TLS FDs under a still-unwinding worker.
@@ -957,6 +973,8 @@ class AIAgent(
         """Release every resource this agent holds (idempotent); each phase is guarded so one failure never
         blocks the rest."""
         # close() is the hard owner boundary; shutdown_memory_provider() is idempotent so gateway pre-calls
+        # idle-triggered-background-review (local): drop any scheduled-but-unfired review (idempotent).
+        _quietly(lambda: getattr(self, "_bg_review_scheduler", None) and self._bg_review_scheduler.shutdown(reason="agent close"))
         # never double-extract.
         session_messages = getattr(self, "_session_messages", None)
         _quietly(self.shutdown_memory_provider, session_messages if isinstance(session_messages, list) else None)
