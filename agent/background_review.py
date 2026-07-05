@@ -23,6 +23,9 @@ import json
 import logging
 import os
 from pathlib import Path
+import threading
+import time
+from collections import deque
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
@@ -1364,6 +1367,251 @@ def spawn_background_review_thread(
     return _target, prompt
 
 
+# ---------------------------------------------------------------------------
+# Idle-trigger scheduling (local patch PATCH-014).
+#
+# On a single-lane provider (one local model instance serving every request
+# serially), the immediately-post-turn review fork competes with the user's
+# NEXT message for the only inference slot: the review's requests enter the
+# provider queue first and interactive turns stall behind a self-improvement
+# pass. Setting auxiliary.background_review.idle_trigger_seconds > 0 defers
+# the fork until the session has been idle that long — no active foreground
+# turn, no newer message. Turns that complete while a window is pending
+# coalesce into one review (a conversation snapshot is cumulative, so the
+# newest snapshot already contains every earlier un-reviewed turn). The
+# default of 0 keeps the stock immediately-post-turn behavior byte-for-byte.
+# ---------------------------------------------------------------------------
+
+
+def _idle_trigger_config() -> tuple[float, bool]:
+    """Read ``(idle_trigger_seconds, coalesce)`` from auxiliary.background_review.
+
+    Returns ``(0.0, True)`` — the stock immediate-spawn behavior — when the
+    key is unset, zero, invalid, or config loading fails. ``coalesce``
+    defaults to True whenever the idle trigger is enabled.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception:
+        return 0.0, True
+    aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+    task = aux.get("background_review", {}) if isinstance(aux.get("background_review"), dict) else {}
+    try:
+        idle_seconds = float(task.get("idle_trigger_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        idle_seconds = 0.0
+    if idle_seconds <= 0:
+        return 0.0, True
+    return idle_seconds, bool(task.get("coalesce", True))
+
+
+class IdleReviewScheduler:
+    """Debounce the background review until the session goes idle.
+
+    One instance per parent ``AIAgent``, lazily attached as
+    ``agent._bg_review_scheduler`` by :func:`get_idle_review_scheduler`.
+    All state transitions hold ``_lock``; the timer is a daemon
+    ``threading.Timer`` so it can never block interpreter exit, and
+    ``shutdown()`` is idempotent (safe from ``close()``,
+    ``release_clients()``, and repeated calls).
+
+    Semantics:
+
+    - ``schedule()`` records the pending review and (re)arms the timer. It
+      never runs inference inline.
+    - The timer callback re-checks *at fire time* that no foreground turn is
+      active and that a full idle window has elapsed since the last
+      foreground activity; otherwise it re-arms itself. A new user message
+      during the wait therefore resets the debounce without any cancel
+      choreography (the turn-start/turn-end hooks below just stamp
+      ``_last_activity`` and bump ``_active_turns``).
+    - A review that is already mid-flight is never cancelled — it is bounded
+      by the fork's own ``max_iterations``. This scheduler only controls when
+      a review STARTS.
+    - Coalesce (the default): the newest snapshot replaces the previous
+      pending one and trigger flags are OR-merged, so one review covers every
+      un-reviewed turn. With ``coalesce: false`` entries queue FIFO and drain
+      one per idle window while the session stays idle.
+    - A scheduled-but-unfired review at shutdown is dropped with a log line,
+      not an error — expected on gateway shutdown/restart.
+    """
+
+    _REARM_SLACK_SECONDS = 0.05
+
+    def __init__(self, agent: Any) -> None:
+        self._agent = agent
+        self._lock = threading.Lock()
+        self._timer: Optional[threading.Timer] = None
+        self._pending: deque = deque()
+        self._idle_seconds: float = 0.0
+        self._coalesce: bool = True
+        self._active_turns: int = 0
+        self._last_activity: float = time.monotonic()
+        self._shut_down: bool = False
+
+    def configure(self, idle_seconds: float, coalesce: bool) -> None:
+        with self._lock:
+            self._idle_seconds = float(idle_seconds)
+            self._coalesce = bool(coalesce)
+
+    # -- foreground-activity hooks (cheap; once per turn) -------------------
+
+    def note_turn_start(self) -> None:
+        with self._lock:
+            self._active_turns += 1
+            self._last_activity = time.monotonic()
+
+    def note_turn_end(self) -> None:
+        with self._lock:
+            self._active_turns = max(0, self._active_turns - 1)
+            self._last_activity = time.monotonic()
+
+    # -- scheduling ----------------------------------------------------------
+
+    def schedule(
+        self,
+        messages_snapshot: List[Dict],
+        review_memory: bool = False,
+        review_skills: bool = False,
+    ) -> None:
+        """Record a pending review and (re)arm the idle debounce timer."""
+        with self._lock:
+            if self._shut_down:
+                logger.info(
+                    "background review not scheduled: scheduler already shut down"
+                )
+                return
+            entry = {
+                "snapshot": messages_snapshot,
+                "review_memory": bool(review_memory),
+                "review_skills": bool(review_skills),
+                "turns": 1,
+            }
+            if self._coalesce and self._pending:
+                prev = self._pending.pop()
+                entry["review_memory"] = entry["review_memory"] or prev["review_memory"]
+                entry["review_skills"] = entry["review_skills"] or prev["review_skills"]
+                entry["turns"] = prev["turns"] + 1
+            self._pending.append(entry)
+            self._last_activity = time.monotonic()
+            self._arm_locked(self._idle_seconds)
+            logger.info(
+                "background review deferred until %.0fs idle "
+                "(pending turns: %d, coalesce=%s)",
+                self._idle_seconds,
+                sum(e["turns"] for e in self._pending),
+                self._coalesce,
+            )
+
+    def _arm_locked(self, delay: float) -> None:
+        """(Re)start the debounce timer. Caller must hold ``_lock``."""
+        if self._timer is not None:
+            self._timer.cancel()
+        timer = threading.Timer(max(delay, self._REARM_SLACK_SECONDS), self._fire)
+        timer.daemon = True
+        timer.name = "bg-review-idle"
+        self._timer = timer
+        timer.start()
+
+    def _fire(self) -> None:
+        entry = None
+        with self._lock:
+            self._timer = None
+            if self._shut_down or not self._pending:
+                return
+            if self._active_turns > 0:
+                # A foreground turn is in flight — full re-debounce from now.
+                self._arm_locked(self._idle_seconds)
+                return
+            remaining = self._idle_seconds - (time.monotonic() - self._last_activity)
+            if remaining > self._REARM_SLACK_SECONDS:
+                # Activity happened during the wait — sleep out the rest.
+                self._arm_locked(remaining)
+                return
+            entry = self._pending.popleft()
+            if self._pending:
+                # coalesce=false backlog: drain one entry per idle window.
+                self._arm_locked(self._idle_seconds)
+        try:
+            logger.info(
+                "background review firing after idle window (covers %d turn(s))",
+                entry["turns"],
+            )
+            self._agent._spawn_background_review_now(
+                messages_snapshot=entry["snapshot"],
+                review_memory=entry["review_memory"],
+                review_skills=entry["review_skills"],
+            )
+        except Exception as e:
+            logger.warning("idle-triggered background review failed to spawn: %s", e)
+
+    def shutdown(self, reason: str = "agent close") -> None:
+        """Cancel the debounce timer and drop any scheduled-but-unfired review.
+
+        Idempotent; never raises. A dropped review is expected on gateway
+        shutdown/restart and is logged as info, not an error.
+        """
+        with self._lock:
+            already = self._shut_down
+            self._shut_down = True
+            if self._timer is not None:
+                try:
+                    self._timer.cancel()
+                except Exception:
+                    pass
+                self._timer = None
+            dropped = sum(e["turns"] for e in self._pending)
+            self._pending.clear()
+        if dropped and not already:
+            logger.info(
+                "dropping scheduled background review at %s "
+                "(%d unreviewed turn(s)) — expected on shutdown/restart",
+                reason,
+                dropped,
+            )
+
+
+def get_idle_review_scheduler(agent: Any) -> Optional[IdleReviewScheduler]:
+    """Return the agent's idle-review scheduler, or None for immediate mode.
+
+    None (idle_trigger_seconds unset/0) means the caller should spawn the
+    review immediately — the stock behavior. Otherwise the scheduler is
+    lazily created, cached on the agent, and refreshed with the current
+    config values. A scheduler that was shut down (agent closed/evicted) is
+    NOT resurrected; its ``schedule()`` drops with a log line.
+    """
+    idle_seconds, coalesce = _idle_trigger_config()
+    if idle_seconds <= 0:
+        return None
+    scheduler = getattr(agent, "_bg_review_scheduler", None)
+    if scheduler is None:
+        scheduler = IdleReviewScheduler(agent)
+        agent._bg_review_scheduler = scheduler
+    scheduler.configure(idle_seconds, coalesce)
+    return scheduler
+
+
+def note_foreground_turn_start(agent: Any) -> None:
+    """Stamp foreground activity at turn start. No-op without a scheduler."""
+    scheduler = getattr(agent, "_bg_review_scheduler", None)
+    if scheduler is not None:
+        try:
+            scheduler.note_turn_start()
+        except Exception:
+            pass
+
+
+def note_foreground_turn_end(agent: Any) -> None:
+    """Stamp foreground activity at turn end. No-op without a scheduler."""
+    scheduler = getattr(agent, "_bg_review_scheduler", None)
+    if scheduler is not None:
+        try:
+            scheduler.note_turn_end()
+        except Exception:
+            pass
+
+
 __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
@@ -1373,4 +1621,8 @@ __all__ = [
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",
+    "IdleReviewScheduler",
+    "get_idle_review_scheduler",
+    "note_foreground_turn_start",
+    "note_foreground_turn_end",
 ]

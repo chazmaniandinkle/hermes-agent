@@ -1807,6 +1807,45 @@ class AIAgent:
         review_skills: bool = False,
         focus: Optional[str] = None,
     ) -> None:
+        """Spawn or defer the background memory/skill review.
+
+        Default (``auxiliary.background_review.idle_trigger_seconds`` unset
+        or 0): spawn the review thread immediately — the stock behavior.
+        When the idle trigger is enabled, hand the request to the per-agent
+        ``IdleReviewScheduler`` instead: the review fires only once the
+        session has been idle that long, so on single-lane providers it
+        never queues ahead of live user messages (local patch PATCH-014).
+        """
+        scheduler = None
+        try:
+            from agent.background_review import get_idle_review_scheduler
+            scheduler = get_idle_review_scheduler(self)
+        except Exception:
+            scheduler = None
+        # An explicit /refine (``focus`` set) is a deliberate user request —
+        # run it now rather than deferring it into the idle window; only the
+        # automatic post-turn triggers (focus=None) are debounced (PATCH-014).
+        if scheduler is not None and focus is None:
+            scheduler.schedule(
+                messages_snapshot,
+                review_memory=review_memory,
+                review_skills=review_skills,
+            )
+            return
+        self._spawn_background_review_now(
+            messages_snapshot,
+            review_memory=review_memory,
+            review_skills=review_skills,
+            focus=focus,
+        )
+
+    def _spawn_background_review_now(
+        self,
+        messages_snapshot: List[Dict],
+        review_memory: bool = False,
+        review_skills: bool = False,
+        focus: Optional[str] = None,
+    ) -> None:
         """Spawn the background memory/skill review thread.
 
         Thin wrapper — the heavy lifting lives in
@@ -4419,6 +4458,19 @@ class AIAgent:
         hard teardown for actual session boundaries (/new, /reset, session
         expiry).
         """
+        # Cancel any scheduled-but-unfired idle-triggered background review
+        # (PATCH-014). This agent object is being discarded from the cache;
+        # the rebuilt agent for the same session gets a fresh scheduler and
+        # future turns re-schedule. Holding the timer alive would pin the
+        # (potentially large) messages snapshot and spawn a review from a
+        # released agent. Idempotent; the scheduler logs the drop.
+        try:
+            _bg_scheduler = getattr(self, "_bg_review_scheduler", None)
+            if _bg_scheduler is not None:
+                _bg_scheduler.shutdown(reason="agent cache eviction")
+        except Exception:
+            pass
+
         # Close active child agents (per-turn; no cross-turn persistence).
         try:
             with self._active_children_lock:
@@ -4487,6 +4539,17 @@ class AIAgent:
             pass
 
         task_id = getattr(self, "session_id", None) or ""
+
+        # 0. Cancel any scheduled-but-unfired idle-triggered background
+        # review (PATCH-014). Idempotent, daemon-safe; a pending review is
+        # deliberately dropped at teardown (the scheduler logs the drop —
+        # it is expected on shutdown/restart, not an error).
+        try:
+            _bg_scheduler = getattr(self, "_bg_review_scheduler", None)
+            if _bg_scheduler is not None:
+                _bg_scheduler.shutdown(reason="agent close")
+        except Exception:
+            pass
 
         # 1. Kill background processes for this task
         try:
@@ -8354,6 +8417,14 @@ class AIAgent:
         )
         from agent import relay_runtime
         from agent.conversation_loop import run_conversation
+        # Stamp foreground activity around the turn so an idle-triggered
+        # background review (PATCH-014) never fires while a turn is running
+        # and re-debounces on every new user message. Passive no-ops unless
+        # auxiliary.background_review.idle_trigger_seconds is enabled.
+        from agent.background_review import (
+            note_foreground_turn_start,
+            note_foreground_turn_end,
+        )
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
@@ -8423,6 +8494,7 @@ class AIAgent:
                 with redirect_lock:
                     _clear_if_owned()
 
+        note_foreground_turn_start(self)
         try:
             # Serialize the full load -> run -> flush region across Hermes
             # processes. Gateway's asyncio lease closes alias routing inside one
@@ -8752,6 +8824,7 @@ class AIAgent:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            note_foreground_turn_end(self)
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(

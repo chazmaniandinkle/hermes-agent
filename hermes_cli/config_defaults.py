@@ -1169,6 +1169,20 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+            # Idle trigger (seconds). 0 (default) = spawn the review fork
+            # immediately after the turn — stock behavior. > 0 = defer the
+            # review until the session has been idle that long (no active
+            # foreground turn, no newer message), so on single-lane / local
+            # providers the review never queues ahead of live user messages.
+            # A new message during the wait resets the debounce; a review
+            # already running is never cancelled (bounded by max iterations).
+            "idle_trigger_seconds": 0,
+            # When the idle trigger is enabled and several turns complete
+            # before an idle window opens, coalesce them into ONE review
+            # covering all un-reviewed turns (a conversation snapshot is
+            # cumulative). false = queue per-turn reviews and drain one per
+            # idle window. Ignored when idle_trigger_seconds is 0.
+            "coalesce": True,
         },
         "moa_reference": {
             "provider": "auto",
