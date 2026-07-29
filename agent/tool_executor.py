@@ -40,6 +40,7 @@ from agent.tool_dispatch_helpers import (
     _append_subdir_hint_to_multimodal,
     _plan_tool_batch_segments,
     make_tool_result_message,
+    find_last_user_message_text,
 )
 from tools.terminal_tool import (
     get_active_env,
@@ -53,6 +54,28 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 
 logger = logging.getLogger(__name__)
 
+
+def _tool_result_message_kwargs(agent, messages: list) -> dict:
+    """Shared ``make_tool_result_message`` kwargs for the Ornith-derail
+    frame re-anchor fix (F4).
+
+    ``find_last_user_message_text`` re-derives "the live question" from the
+    transcript itself rather than threading a variable through several call
+    frames, so it stays correct even when the re-anchor fires several
+    tool-call iterations after the user actually spoke. Fails open (no-op)
+    if the agent lacks the re-anchor attributes, e.g. lightweight test
+    doubles.
+    """
+    if not getattr(agent, "_frame_reanchor_enabled", True):
+        reanchor_question = None
+    else:
+        reanchor_question = find_last_user_message_text(messages) or None
+    return {
+        "reanchor_question": reanchor_question,
+        "reanchor_threshold_bytes": getattr(
+            agent, "_frame_reanchor_threshold_bytes", 4096
+        ),
+    }
 
 def _ensure_file_checkpoint(
     agent,
@@ -1788,6 +1811,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             _tool_content,
             tc.id,
             effect_disposition=effect_disposition,
+            **_tool_result_message_kwargs(agent, messages),
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
@@ -2596,6 +2620,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _tool_content,
             tool_call.id,
             effect_disposition="unknown" if _execution_timed_out else None,
+            **_tool_result_message_kwargs(agent, messages),
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")

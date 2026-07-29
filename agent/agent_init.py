@@ -1768,6 +1768,22 @@ def init_agent(
         agent._repetition_guard_config = RepetitionGuardConfig()
     agent._repetition_guard_halt_decision = None
 
+    # Ornith derail case-study fix F4: frame re-anchor. After a big tool
+    # result, append one minimal line naming the live user question so a
+    # long retrieval's own discourse can't displace the actual conversation
+    # ("frame capture" -- see agent.tool_dispatch_helpers.make_tool_result_
+    # message).
+    _frame_reanchor_cfg = _agent_cfg.get("frame_reanchor", {}) or {}
+    if not isinstance(_frame_reanchor_cfg, dict):
+        _frame_reanchor_cfg = {}
+    agent._frame_reanchor_enabled = bool(_frame_reanchor_cfg.get("enabled", True))
+    try:
+        agent._frame_reanchor_threshold_bytes = int(
+            _frame_reanchor_cfg.get("threshold_bytes", 4096) or 4096
+        )
+    except (TypeError, ValueError):
+        agent._frame_reanchor_threshold_bytes = 4096
+
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.

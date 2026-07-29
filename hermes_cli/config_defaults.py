@@ -159,6 +159,14 @@ DEFAULT_CONFIG = {
             "halt_after": 3,   # occurrences (3 = second consecutive duplicate)
             "near_duplicate_threshold": 0.92,  # normalized similarity ratio
         },
+        # Ornith derail case-study fix F4 (2026-07-29): after a tool result
+        # larger than threshold_bytes, append one minimal line naming the live
+        # user question so a long retrieval's own discourse doesn't displace
+        # the actual conversation ("frame capture").
+        "frame_reanchor": {
+            "enabled": True,
+            "threshold_bytes": 4096,
+        },
         # Intent-ack continuation: when the model opens a turn by narrating an
         # action it will take ("I'll go check the logs...") but emits no tool
         # call, intercept the turn-end, inject a "continue now, execute the

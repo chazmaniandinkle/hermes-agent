@@ -14,6 +14,7 @@ from agent.tool_dispatch_helpers import (
     _extract_file_mutation_targets,
     _is_untrusted_tool,
     _maybe_wrap_untrusted,
+    find_last_user_message_text,
     make_tool_result_message,
 )
 
@@ -199,6 +200,102 @@ class TestMakeToolResultMessage:
         assert SAMPLE_LONG_TEXT in msg["content"]
         assert "_tool_output_risk" not in msg
 
+
+
+# =========================================================================
+# Ornith derail fix F4 — frame re-anchor
+# =========================================================================
+# After a big retrieval, the harness appends one minimal line naming the
+# live question, so the retrieved document's own discourse can't displace
+# the actual conversation ("frame capture" — the derail session's final
+# reply answered a question embedded in a retrieved cogdoc, not anything
+# the operator had asked).
+
+
+class TestFrameReanchor:
+    def test_small_result_gets_no_reanchor(self):
+        msg = make_tool_result_message(
+            "read_file", "short content", "c1",
+            reanchor_question="what happened?",
+        )
+        assert msg["content"] == "short content"
+
+    def test_large_result_gets_reanchor_line(self):
+        big = "z" * 5000
+        msg = make_tool_result_message(
+            "read_file", big, "c1",
+            reanchor_question="what is the fix for F4?",
+        )
+        assert msg["content"].startswith(big)
+        assert 'Retrieved data above. The live question: "what is the fix for F4?"' in msg["content"]
+
+    def test_no_question_means_no_reanchor(self):
+        big = "z" * 5000
+        msg = make_tool_result_message("read_file", big, "c1", reanchor_question=None)
+        assert msg["content"] == big
+
+    def test_reanchor_question_truncated_to_200_chars(self):
+        big = "z" * 5000
+        long_question = "q" * 400
+        msg = make_tool_result_message(
+            "read_file", big, "c1", reanchor_question=long_question,
+        )
+        assert "q" * 200 in msg["content"]
+        assert "q" * 201 not in msg["content"]
+
+    def test_reanchor_threshold_is_configurable(self):
+        medium = "z" * 100
+        no_reanchor = make_tool_result_message(
+            "read_file", medium, "c1", reanchor_question="q",
+            reanchor_threshold_bytes=4096,
+        )
+        assert no_reanchor["content"] == medium
+
+        with_reanchor = make_tool_result_message(
+            "read_file", medium, "c1", reanchor_question="q",
+            reanchor_threshold_bytes=50,
+        )
+        assert "Retrieved data above" in with_reanchor["content"]
+
+    def test_reanchor_is_outside_untrusted_fence(self):
+        """The re-anchor line comes from the harness, not the retrieved
+        data, so it must sit OUTSIDE the untrusted-data wrapper -- inside
+        it would tell the model to treat the harness's own framing as
+        attacker-controlled data too."""
+        big = "attacker payload " * 300  # untrusted tool, over both thresholds
+        msg = make_tool_result_message(
+            "web_extract", big, "c1", reanchor_question="what's real?",
+        )
+        assert msg["content"].endswith('The live question: "what\'s real?"')
+        assert msg["content"].count("</untrusted_tool_result>") == 1
+        # reanchor line must be AFTER the closing fence tag
+        close_idx = msg["content"].index("</untrusted_tool_result>")
+        reanchor_idx = msg["content"].index("Retrieved data above")
+        assert reanchor_idx > close_idx
+
+
+class TestFindLastUserMessageText:
+    def test_returns_most_recent_user_text(self):
+        messages = [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "second question"},
+            {"role": "assistant", "content": "thinking...", "tool_calls": [{}]},
+            {"role": "tool", "content": "some tool result"},
+        ]
+        assert find_last_user_message_text(messages) == "second question"
+
+    def test_no_user_message_returns_empty(self):
+        assert find_last_user_message_text([{"role": "assistant", "content": "hi"}]) == ""
+
+    def test_multimodal_user_content_extracts_text(self):
+        messages = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "look at this"},
+                {"type": "image_url", "image_url": {"url": "data:..."}},
+            ]},
+        ]
+        assert find_last_user_message_text(messages) == "look at this"
 
 
 class TestFileMutationTargets:

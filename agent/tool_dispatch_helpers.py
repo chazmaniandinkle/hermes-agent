@@ -30,7 +30,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from agent.message_metadata import stamp_message_timestamp
 from agent.tool_result_classification import (
@@ -39,6 +39,11 @@ from agent.tool_result_classification import (
 from tools.threat_patterns import scan_for_threats
 
 logger = logging.getLogger(__name__)
+
+# Frame re-anchor threshold (Ornith derail fix F4). Declared up top since
+# ``make_tool_result_message`` below references it as a default argument
+# value, which Python evaluates at function-definition time.
+_FRAME_REANCHOR_THRESHOLD_BYTES = 4096
 
 # Tools that must never run concurrently (interactive / user-facing).
 # When any of these appear in a batch, we fall back to sequential execution.
@@ -537,6 +542,8 @@ def make_tool_result_message(
     tool_call_id: str,
     *,
     effect_disposition: str | None = None,
+    reanchor_question: Optional[str] = None,
+    reanchor_threshold_bytes: int = _FRAME_REANCHOR_THRESHOLD_BYTES,
 ) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
@@ -556,8 +563,20 @@ def make_tool_result_message(
     neutralized and framed). Non-text parts (e.g. image_url) are preserved.
     The outer list itself is rebuilt rather than returned by identity, so
     callers should compare by value, not by ``is``.
+
+    ``reanchor_question`` (Ornith derail fix F4 — frame re-anchor): when the
+    (pre-wrap) content is larger than ``reanchor_threshold_bytes``, append
+    one minimal line after it naming the live user question, so a long
+    retrieval doesn't let the document's own voice/discourse displace the
+    actual conversation (frame capture). ``None`` disables the re-anchor.
     """
     wrapped = _maybe_wrap_untrusted(name, content)
+    wrapped = _maybe_append_frame_reanchor(
+        content,
+        wrapped,
+        reanchor_question=reanchor_question,
+        threshold_bytes=reanchor_threshold_bytes,
+    )
     message = stamp_message_timestamp({
         "role": "tool",
         "name": name,
@@ -707,6 +726,98 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
     return content
 
 
+# Frame re-anchor (Ornith derail fix F4): after a big tool result, a small
+# model's own attention can drift into the RETRIEVED document's discourse
+# rather than the live conversation ("frame capture" -- the final reply in
+# the derail session answered a question that only existed inside a
+# retrieved cogdoc). One minimal line after the data, naming the live
+# question, is cheap and targets the mechanism directly. Per the
+# calibration principle this must stay a single sentence with no
+# boilerplate, or it becomes the next repeated-token attractor.
+_FRAME_REANCHOR_QUESTION_MAX_CHARS = 200
+
+
+def _raw_text_len_bytes(content: Any) -> int:
+    if isinstance(content, str):
+        return len(content.encode("utf-8", errors="ignore"))
+    if isinstance(content, list):
+        return sum(
+            len(item.get("text", "").encode("utf-8", errors="ignore"))
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    return 0
+
+
+def _frame_reanchor_line(question: str) -> str:
+    trimmed = (question or "").strip().replace("\n", " ")
+    if len(trimmed) > _FRAME_REANCHOR_QUESTION_MAX_CHARS:
+        trimmed = trimmed[:_FRAME_REANCHOR_QUESTION_MAX_CHARS].rstrip() + "..."
+    return f'\n\nRetrieved data above. The live question: "{trimmed}"'
+
+
+def _maybe_append_frame_reanchor(
+    raw_content: Any,
+    wrapped_content: Any,
+    *,
+    reanchor_question: Optional[str] = None,
+    threshold_bytes: int = _FRAME_REANCHOR_THRESHOLD_BYTES,
+) -> Any:
+    """Append the one-line frame re-anchor after a large tool result.
+
+    Sizes against ``raw_content`` (the un-wrapped result) so the threshold
+    reflects actual retrieved-data volume, not fence overhead. Appended
+    OUTSIDE/after any untrusted-data fence — this line comes from the
+    harness itself, not from the retrieved data, so it is trusted framing,
+    not something that needs (or should get) the untrusted wrapper.
+    """
+    if not reanchor_question or not (reanchor_question or "").strip():
+        return wrapped_content
+    if _raw_text_len_bytes(raw_content) < threshold_bytes:
+        return wrapped_content
+    line = _frame_reanchor_line(reanchor_question)
+    if isinstance(wrapped_content, str):
+        return wrapped_content + line
+    if isinstance(wrapped_content, list):
+        rebuilt = list(wrapped_content)
+        for idx in range(len(rebuilt) - 1, -1, -1):
+            item = rebuilt[idx]
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                rebuilt[idx] = {**item, "text": item["text"] + line}
+                return rebuilt
+        # No text part to attach to (e.g. image-only result) -- append one.
+        rebuilt.append({"type": "text", "text": line.strip()})
+        return rebuilt
+    return wrapped_content
+
+
+def find_last_user_message_text(messages: Sequence[Mapping[str, Any]]) -> str:
+    """Return the most recent user-turn text in ``messages``, or "".
+
+    Pure/stateless scan used to feed the frame re-anchor line ("the live
+    question") -- deriving it from the transcript itself (rather than a
+    variable threaded through several call frames) keeps it correct even
+    when the re-anchor fires several tool-call iterations after the user
+    actually spoke.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, Mapping) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            parts = [
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            joined = "".join(parts).strip()
+            if joined:
+                return joined
+    return ""
+
+
 __all__ = [
     "_NEVER_PARALLEL_TOOLS",
     "_PARALLEL_SAFE_TOOLS",
@@ -730,4 +841,5 @@ __all__ = [
     "_extract_error_preview",
     "_trajectory_normalize_msg",
     "make_tool_result_message",
+    "find_last_user_message_text",
 ]
