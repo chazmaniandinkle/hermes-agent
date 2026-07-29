@@ -1805,6 +1805,12 @@ def init_agent(
         _trunc_cont_cfg.get("mode", "prefill") or "prefill"
     ).strip().lower()
 
+    # Ornith derail case-study fix #5: fence-once-per-turn. Mutable
+    # per-turn state (reset in turn_context.py) tracking whether the full
+    # <untrusted_tool_result> instructional fence has already been emitted
+    # this turn; see agent.tool_dispatch_helpers._maybe_wrap_untrusted.
+    agent._untrusted_fence_state = {"used": False}
+
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.

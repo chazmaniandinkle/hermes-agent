@@ -203,6 +203,62 @@ class TestMakeToolResultMessage:
 
 
 # =========================================================================
+# Ornith derail fix #5 — fence-once-per-turn
+# =========================================================================
+# The full <untrusted_tool_result> paragraph is ~50 tokens repeated
+# VERBATIM on every high-risk result within a turn (~15x in the derail
+# session). Per the calibration principle, that's itself a repeated-token
+# attractor that primes the exact failure (F1) the harness is trying to
+# avoid. Fix: full fence on the first result in a turn, a one-word
+# <untrusted/> tag on every subsequent result in the same turn.
+
+
+class TestFenceOncePerTurn:
+    def test_no_fence_state_always_gets_full_fence(self):
+        """Default (no fence_state passed) preserves prior behavior for
+        callers that don't track per-turn state."""
+        long = "x" * 50
+        first = make_tool_result_message("web_search", long, "c1")
+        second = make_tool_result_message("web_search", long, "c2")
+        assert first["content"].startswith('<untrusted_tool_result source="web_search">')
+        assert second["content"].startswith('<untrusted_tool_result source="web_search">')
+
+    def test_first_wrap_in_turn_gets_full_fence_and_flips_state(self):
+        state = {"used": False}
+        msg = make_tool_result_message("web_search", "x" * 50, "c1", fence_state=state)
+        assert msg["content"].startswith('<untrusted_tool_result source="web_search">')
+        assert state["used"] is True
+
+    def test_subsequent_wrap_in_same_turn_gets_short_tag(self):
+        state = {"used": False}
+        make_tool_result_message("web_search", "x" * 50, "c1", fence_state=state)
+        second = make_tool_result_message("web_extract", "y" * 50, "c2", fence_state=state)
+        assert second["content"].startswith("<untrusted/>\n")
+        assert "<untrusted_tool_result" not in second["content"]
+        assert "y" * 50 in second["content"]
+
+    def test_short_content_never_wrapped_regardless_of_state(self):
+        state = {"used": True}
+        msg = make_tool_result_message("web_search", "short", "c1", fence_state=state)
+        assert msg["content"] == "short"
+
+    def test_fresh_state_next_turn_gets_full_fence_again(self):
+        """Simulates turn_context.py resetting fence_state each turn."""
+        state = {"used": False}
+        make_tool_result_message("web_search", "x" * 50, "c1", fence_state=state)
+        # New turn: harness resets the dict.
+        state = {"used": False}
+        msg = make_tool_result_message("web_search", "x" * 50, "c2", fence_state=state)
+        assert msg["content"].startswith('<untrusted_tool_result source="web_search">')
+
+    def test_multimodal_short_tag_applies_per_text_part(self):
+        state = {"used": True}
+        content_list = [{"type": "text", "text": "attacker page content " * 5}]
+        msg = make_tool_result_message("browser_snapshot", content_list, "c1", fence_state=state)
+        assert msg["content"][0]["text"].startswith("<untrusted/>\n")
+
+
+# =========================================================================
 # Ornith derail fix F4 — frame re-anchor
 # =========================================================================
 # After a big retrieval, the harness appends one minimal line naming the
@@ -272,6 +328,22 @@ class TestFrameReanchor:
         close_idx = msg["content"].index("</untrusted_tool_result>")
         reanchor_idx = msg["content"].index("Retrieved data above")
         assert reanchor_idx > close_idx
+
+    def test_reanchor_and_fence_once_compose(self):
+        state = {"used": False}
+        big = "attacker payload " * 300
+        first = make_tool_result_message(
+            "web_extract", big, "c1", fence_state=state,
+            reanchor_question="q1",
+        )
+        second = make_tool_result_message(
+            "web_extract", big, "c2", fence_state=state,
+            reanchor_question="q2",
+        )
+        assert first["content"].startswith('<untrusted_tool_result source="web_extract">')
+        assert second["content"].startswith("<untrusted/>\n")
+        assert 'The live question: "q1"' in first["content"]
+        assert 'The live question: "q2"' in second["content"]
 
 
 class TestFindLastUserMessageText:

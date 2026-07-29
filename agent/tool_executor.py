@@ -56,21 +56,23 @@ logger = logging.getLogger(__name__)
 
 
 def _tool_result_message_kwargs(agent, messages: list) -> dict:
-    """Shared ``make_tool_result_message`` kwargs for the Ornith-derail
-    frame re-anchor fix (F4).
+    """Shared ``make_tool_result_message`` kwargs for two Ornith-derail
+    fixes: fence-once-per-turn (#5) and the frame re-anchor (F4).
 
-    ``find_last_user_message_text`` re-derives "the live question" from the
-    transcript itself rather than threading a variable through several call
-    frames, so it stays correct even when the re-anchor fires several
-    tool-call iterations after the user actually spoke. Fails open (no-op)
-    if the agent lacks the re-anchor attributes, e.g. lightweight test
-    doubles.
+    ``agent._untrusted_fence_state`` is a per-turn mutable dict reset in
+    ``turn_context.py``; ``find_last_user_message_text`` re-derives "the
+    live question" from the transcript itself rather than threading a
+    variable through several call frames, so it stays correct even when
+    the re-anchor fires several tool-call iterations after the user
+    actually spoke. Both features fail open (no-op) if the agent lacks the
+    attributes, e.g. lightweight test doubles.
     """
     if not getattr(agent, "_frame_reanchor_enabled", True):
         reanchor_question = None
     else:
         reanchor_question = find_last_user_message_text(messages) or None
     return {
+        "fence_state": getattr(agent, "_untrusted_fence_state", None),
         "reanchor_question": reanchor_question,
         "reanchor_threshold_bytes": getattr(
             agent, "_frame_reanchor_threshold_bytes", 4096

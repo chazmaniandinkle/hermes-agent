@@ -583,6 +583,8 @@ def build_turn_context(
     agent._tool_guardrail_halt_decision = None
     # Ornith derail fix F1: the repetition guard's halt flag is turn-scoped.
     agent._repetition_guard_halt_decision = None
+    # Ornith derail fix #5: fence-once-per-turn state also resets per turn.
+    agent._untrusted_fence_state = {"used": False}
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()
