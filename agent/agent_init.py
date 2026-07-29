@@ -1792,6 +1792,19 @@ def init_agent(
         _tool_pin_cfg = {}
     agent._tool_inventory_pinning_enabled = bool(_tool_pin_cfg.get("enabled", True))
 
+    # Ornith derail case-study fix F2: truncation-continuation mode.
+    # "prefill" resends the truncated text as a trailing assistant turn
+    # (mechanical continuation); "instruction" falls back to the older
+    # "continue exactly where you left off" nudge (with the truncated tail
+    # appended) for providers that reject/mishandle a trailing-assistant
+    # request.
+    _trunc_cont_cfg = _agent_cfg.get("truncation_continuation", {}) or {}
+    if not isinstance(_trunc_cont_cfg, dict):
+        _trunc_cont_cfg = {}
+    agent._truncation_continuation_mode = str(
+        _trunc_cont_cfg.get("mode", "prefill") or "prefill"
+    ).strip().lower()
+
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.

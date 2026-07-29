@@ -1058,8 +1058,26 @@ _LENGTH_CONTINUATION_OUTPUT_LIMIT = (
 # _is_synthetic_compression_user_turn checks with str.startswith instead.
 _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
 
+# Stable prefix of the tail-bearing output-limit variant below (Ornith derail
+# fix F2) so _is_synthetic_compression_user_turn can recognize it the same
+# way it recognizes _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX.
+_LENGTH_CONTINUATION_TAIL_PREFIX = (
+    "[System: Your previous response was truncated by the output "
+    "length limit. It ended with:"
+)
 
-def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
+# Ornith derail fix F2: the tail of the truncated text included in the
+# instruction fallback below, when the provider path can't do a real
+# trailing-assistant prefill. Short enough to stay a hint, not a second
+# copy of the whole truncated response (which is already in `messages`).
+_TRUNCATION_TAIL_CHARS = 300
+
+
+def _get_continuation_prompt(
+    is_partial_stub: bool,
+    dropped_tools: Optional[List[str]] = None,
+    truncated_tail: Optional[str] = None,
+) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
         return (
@@ -1078,6 +1096,22 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
     elif is_partial_stub:
         return _LENGTH_CONTINUATION_NETWORK_STUB
     else:
+        # Ornith derail fix F2: the bare "continue exactly where you left
+        # off" instruction was observed producing a restart from the top
+        # instead of a continuation on a local model under load. Prefill
+        # (see the call site) is the primary fix -- this text-only path is
+        # the documented fallback for providers that reject/mishandle a
+        # trailing-assistant-turn request, and it earns its keep by giving
+        # the model the literal tail to key off instead of only a verbal
+        # instruction to remember its own cutoff point.
+        tail = (truncated_tail or "").strip()
+        if tail:
+            tail = tail[-_TRUNCATION_TAIL_CHARS:]
+            return (
+                _LENGTH_CONTINUATION_TAIL_PREFIX + " \"...\n" + tail + "\"\n"
+                "Continue directly from that exact point. Do not restart, "
+                "repeat prior text, or re-summarize what came before.]"
+            )
         return _LENGTH_CONTINUATION_OUTPUT_LIMIT
 
 
@@ -2220,6 +2254,9 @@ def run_conversation(
             # Strip internal F1 repetition-guard nudge marker; the message
             # content itself (the actual corrective line) is sent as-is.
             api_msg.pop("_repetition_guard_synthetic", None)
+            # Strip internal F2 length-truncation-prefill marker (see
+            # agent.repetition_guard's neighbor, the Ornith derail fixes)
+            api_msg.pop("_length_truncation_prefill", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields
@@ -3775,6 +3812,24 @@ def run_conversation(
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
                             length_continue_retries += 1
+                            # Ornith derail fix F2: a network-interrupted
+                            # stream or a mid-tool-call stall needs the
+                            # specialized instructional guidance below
+                            # (chunk the tool call / resume the stream);
+                            # only the plain output-length-cap case is a
+                            # candidate for real mechanical continuation.
+                            _is_partial_stream_stub = (
+                                getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                            )
+                            _dropped_tools = getattr(
+                                response, "_dropped_tool_names", None
+                            )
+                            _plain_length_cap = not _is_partial_stream_stub and not _dropped_tools
+                            _use_prefill = (
+                                _plain_length_cap
+                                and str(getattr(agent, "_truncation_continuation_mode", "prefill"))
+                                == "prefill"
+                            )
                             # An EMPTY partial-stream stub (stream dropped
                             # mid tool-call before any text was delivered)
                             # must not be appended as an interim assistant
@@ -3788,25 +3843,39 @@ def run_conversation(
                             # partial text to continue from anyway, so only
                             # the continuation user-message is appended.
                             _is_empty_partial_stub = (
-                                getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                                _is_partial_stream_stub
                                 and not getattr(assistant_message, "content", None)
                             )
                             if not _is_empty_partial_stub:
                                 interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                                 # Marked so the ceiling exit can drop the fragment trail.
                                 interim_msg["_length_continuation_fragment"] = True
+                                if _use_prefill:
+                                    # Mechanical continuation: resend with the
+                                    # truncated text as a trailing assistant turn
+                                    # (LM Studio / OpenAI-compatible chat-
+                                    # completions servers complete it as a
+                                    # prefix) instead of asking the model to
+                                    # remember where it left off. Same mechanism
+                                    # as thinking-only-response recovery
+                                    # (`_thinking_prefill`); marked so the
+                                    # pop-before-final-append cleanup strips this
+                                    # scaffolding turn the same way. (F2)
+                                    interim_msg["_length_truncation_prefill"] = True
                                 append_message(messages, interim_msg)
                                 if assistant_message.content:
                                     truncated_response_parts.append(assistant_message.content)
 
-                            if length_continue_retries < 4:
-                                _is_partial_stream_stub = (
-                                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                            if length_continue_retries < 4 and _use_prefill:
+                                agent._vprint(
+                                    f"{agent.log_prefix}↻ Requesting continuation via "
+                                    f"prefill ({length_continue_retries}/4)..."
                                 )
-                                _dropped_tools = getattr(
-                                    response, "_dropped_tool_names", None
-                                )
+                                agent._session_messages = messages
+                                _retry.restart_with_length_continuation = True
+                                break
 
+                            if length_continue_retries < 4:
                                 if _is_partial_stream_stub and _dropped_tools:
                                     _tool_list = ", ".join(_dropped_tools[:3])
                                     agent._vprint(
@@ -3828,7 +3897,8 @@ def run_conversation(
                                     )
 
                                 _continue_content = _get_continuation_prompt(
-                                    _is_partial_stream_stub, _dropped_tools
+                                    _is_partial_stream_stub, _dropped_tools,
+                                    truncated_tail=assistant_message.content,
                                 )
                                 continue_msg = {
                                     "role": "user",
@@ -7210,11 +7280,18 @@ def run_conversation(
                 
                 # Pop thinking-only prefill message(s) before appending
                 # (tool-call path — same rationale as the final-response path).
+                # Also pops the F2 length-truncation prefill scaffolding
+                # (`_length_truncation_prefill`) for the same reason: it was
+                # only ever meant to steer the next completion call, not
+                # become a durable (and now superseded) transcript turn.
                 _had_prefill = False
                 while (
                     messages
                     and isinstance(messages[-1], dict)
-                    and messages[-1].get("_thinking_prefill")
+                    and (
+                        messages[-1].get("_thinking_prefill")
+                        or messages[-1].get("_length_truncation_prefill")
+                    )
                 ):
                     messages.pop()
                     _had_prefill = True
@@ -8086,6 +8163,7 @@ def run_conversation(
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
                         or messages[-1].get("_dropped_toolcall_nudge")
+                        or messages[-1].get("_length_truncation_prefill")
                     )
                 ):
                     messages.pop()

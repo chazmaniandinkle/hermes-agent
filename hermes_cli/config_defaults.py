@@ -175,6 +175,17 @@ DEFAULT_CONFIG = {
         "tool_inventory_pinning": {
             "enabled": True,
         },
+        # Ornith derail case-study fix F2 (2026-07-29): how Hermes asks a model
+        # to finish a response cut off by the output length limit. "prefill"
+        # resends the truncated text as a trailing assistant turn (mechanical
+        # continuation -- the model completes its own prefix, same mechanism
+        # already used for thinking-only-response recovery). "instruction" uses
+        # the older "continue exactly where you left off" nudge with the
+        # truncated tail appended, for providers that reject/mishandle a
+        # trailing-assistant request.
+        "truncation_continuation": {
+            "mode": "prefill",  # "prefill" | "instruction"
+        },
         # Intent-ack continuation: when the model opens a turn by narrating an
         # action it will take ("I'll go check the logs...") but emits no tool
         # call, intercept the turn-end, inject a "continue now, execute the
