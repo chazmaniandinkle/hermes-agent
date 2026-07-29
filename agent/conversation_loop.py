@@ -1126,6 +1126,29 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
 )
 
 
+def _build_tool_inventory_pin(tools: Optional[List[Dict[str, Any]]]) -> str:
+    """Build the one-line, names-only tool-inventory reminder (Ornith
+    derail fix F3). Returns "" when there are no tools to pin.
+
+    Names only, no descriptions/parameters -- the full schema is already in
+    the ``tools=`` API field and the system prompt; this line exists purely
+    as a recency anchor, so per the calibration principle it stays minimal.
+    """
+    if not tools:
+        return ""
+    names: List[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if isinstance(name, str) and name:
+            names.append(name)
+    if not names:
+        return ""
+    return "\n\n[Available tools: " + ", ".join(names) + "]"
+
+
 # Shared recovery hint appended to every content-policy refusal message. Both
 # the HTTP-200 refusal path (``finish_reason=content_filter``) and the
 # exception path (a provider moderation error classified as
@@ -2366,6 +2389,37 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # ── Ornith derail fix F3: tool inventory pinning ───────────────
+        # Recency beats primacy for small models: the full tool inventory
+        # only lives in the system prompt (primacy) and the `tools=`
+        # schema payload the API technically has, but under enough
+        # retrieval volume a local model has been observed flatly denying
+        # it has a tool it had just used four times ("I don't have a
+        # cog_read_cogdoc tool"). A one-line, names-only reminder placed
+        # at the very end of context assembly -- the most recent thing the
+        # model reads before generating -- is cheap insurance against that
+        # specific attention-under-pressure failure. Appended to the last
+        # message's own content (not a new message) so it can't disturb
+        # role-alternation-strict providers.
+        if getattr(agent, "_tool_inventory_pinning_enabled", True):
+            _pin_line = _build_tool_inventory_pin(agent.tools)
+            if _pin_line and api_messages:
+                _last_api_msg = api_messages[-1]
+                _last_content = _last_api_msg.get("content")
+                if isinstance(_last_content, str):
+                    _last_api_msg["content"] = _last_content + _pin_line
+                elif isinstance(_last_content, list):
+                    _appended = False
+                    for _idx in range(len(_last_content) - 1, -1, -1):
+                        _part = _last_content[_idx]
+                        if isinstance(_part, dict) and _part.get("type") == "text" and isinstance(_part.get("text"), str):
+                            _last_content[_idx] = {**_part, "text": _part["text"] + _pin_line}
+                            _appended = True
+                            break
+                    if not _appended:
+                        _last_content.append({"type": "text", "text": _pin_line.strip()})
+
 
         # NOTE (empty-content class fix): no send-time pad loop here.  The
         # single owner for "never send a turn strict wire validation rejects

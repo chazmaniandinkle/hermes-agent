@@ -3008,7 +3008,14 @@ class TestRunConversation:
         ]
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
-        assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
+        # startswith rather than == : Ornith derail fix F3 (tool inventory
+        # pinning) appends a "[Available tools: ...]" reminder to the last
+        # api_message's content each turn, which lands on this very user
+        # message here since it's the only message in the request.
+        assert any(
+            msg.get("role") == "user" and str(msg.get("content", "")).startswith("search something")
+            for msg in pre_request_calls[0]["request_messages"]
+        )
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 

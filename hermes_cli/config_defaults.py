@@ -167,6 +167,14 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "threshold_bytes": 4096,
         },
+        # Ornith derail case-study fix F3 (2026-07-29): re-inject a compact
+        # tool-name-only list near the end of context assembly each turn.
+        # Recency beats primacy for small models -- a tool inventory pinned
+        # only in the system prompt (primacy) can get "forgotten" after enough
+        # retrieval volume; a cheap recency copy keeps it live.
+        "tool_inventory_pinning": {
+            "enabled": True,
+        },
         # Intent-ack continuation: when the model opens a turn by narrating an
         # action it will take ("I'll go check the logs...") but emits no tool
         # call, intercept the turn-end, inject a "continue now, execute the

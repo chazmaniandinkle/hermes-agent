@@ -1784,6 +1784,14 @@ def init_agent(
     except (TypeError, ValueError):
         agent._frame_reanchor_threshold_bytes = 4096
 
+    # Ornith derail case-study fix F3: tool inventory pinning. Recency
+    # beats primacy for small models -- re-inject a compact tool-name-only
+    # list near the end of context assembly each turn.
+    _tool_pin_cfg = _agent_cfg.get("tool_inventory_pinning", {}) or {}
+    if not isinstance(_tool_pin_cfg, dict):
+        _tool_pin_cfg = {}
+    agent._tool_inventory_pinning_enabled = bool(_tool_pin_cfg.get("enabled", True))
+
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.
