@@ -48,6 +48,7 @@ from agent.tool_guardrails import (
     ToolCallGuardrailController,
     ToolGuardrailDecision,
 )
+from agent.turn_repetition_guard import RepetitionGuardConfig
 from hermes_cli.config import cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
@@ -1751,6 +1752,22 @@ def init_agent(
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+
+    # Ornith derail case-study fix F1: assistant repetition guard.
+    # See ~/workspaces/cog/.cog/mem/working/2026-07-29-ornith-derail-case-study/
+    # CASE-STUDY.md. Detects an assistant turn (text or tool call) that is an
+    # exact/near-exact duplicate of the immediately preceding one and
+    # nudges/halts the tool loop -- mirrors the kernel agent loop's
+    # no-progress guard.
+    try:
+        agent._repetition_guard_config = RepetitionGuardConfig.from_mapping(
+            _agent_cfg.get("assistant_repetition_guard", {})
+        )
+    except Exception as _rg_err:
+        _ra().logger.warning("Assistant repetition guard config ignored: %s", _rg_err)
+        agent._repetition_guard_config = RepetitionGuardConfig()
+    agent._repetition_guard_halt_decision = None
+
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.

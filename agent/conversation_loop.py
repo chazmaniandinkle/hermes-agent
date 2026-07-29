@@ -88,6 +88,13 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.repetition_guard import is_repetition_dominated
+from agent.turn_repetition_guard import (
+    REPETITION_WARNING_LINE,
+    RepetitionDecision,
+    RepetitionGuardConfig,
+    detect_text_repetition,
+    detect_tool_call_repetition,
+)
 from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
@@ -2187,6 +2194,9 @@ def run_conversation(
             # Strip length-continuation marks; not every transport drops underscore keys.
             api_msg.pop("_length_continuation_fragment", None)
             api_msg.pop("_length_continuation_nudge", None)
+            # Strip internal F1 repetition-guard nudge marker; the message
+            # content itself (the actual corrective line) is sent as-is.
+            api_msg.pop("_repetition_guard_synthetic", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
             # Uses new dicts so the internal messages list retains the fields
@@ -7062,6 +7072,69 @@ def run_conversation(
                     # line ~4834 — after all tools have finished.
                     agent._mute_post_response = False
 
+                # ── Ornith derail fix F1: assistant repetition guard ────
+                # Detect an assistant turn (text narration, or -- when there
+                # is no narration -- the tool-call set itself) that is an
+                # exact/near-exact duplicate of the immediately preceding
+                # assistant turn already in `messages`. Checked BEFORE this
+                # turn is appended/executed so a would-be third-in-a-row
+                # TEXT repeat never runs. Mirrors the kernel agent loop's
+                # no-progress guard (limit 3): first duplicate -> corrective
+                # nudge (below, after tool execution); second consecutive
+                # duplicate -> halt here, before wasting another API call.
+                #
+                # Tool-call repetition is intentionally WARN-ONLY here, never
+                # a pre-execution halt: ``agent._tool_guardrails`` (tool_
+                # guardrails.py) already owns halting on repeated tool calls,
+                # with thresholds (2/5 exact-failure, 3/8 same-tool-failure)
+                # deliberately tuned looser than a flat limit-3 so a
+                # legitimate retry-through-transient-failure isn't cut off
+                # early. A second, stricter halt here would race ahead of
+                # that tuning and pre-empt calls the existing guardrail is
+                # still willing to let run. The corrective nudge still fires
+                # (below) so the model sees the same "you're repeating"
+                # signal without a second, conflicting hard stop.
+                _rep_cfg = getattr(agent, "_repetition_guard_config", None) or RepetitionGuardConfig()
+                _rep_narration = assistant_message.content or ""
+                if _rep_narration.strip():
+                    _rep_decision = detect_text_repetition(messages, _rep_narration, _rep_cfg)
+                else:
+                    _rep_decision = detect_tool_call_repetition(
+                        messages, assistant_msg.get("tool_calls") or [], _rep_cfg
+                    )
+                    if _rep_decision.should_halt:
+                        _rep_decision = RepetitionDecision(
+                            action="warn",
+                            occurrences=_rep_decision.occurrences,
+                            kind=_rep_decision.kind,
+                            message=REPETITION_WARNING_LINE,
+                        )
+
+                if _rep_decision.should_halt:
+                    _turn_exit_reason = "repetition_guard_halt"
+                    final_response = _rep_decision.message
+                    agent._emit_status(
+                        f"⚠️ Repetition guard halted turn: {_rep_decision.kind} "
+                        f"x{_rep_decision.occurrences}"
+                    )
+                    messages.append({"role": "assistant", "content": final_response})
+                    if agent.stream_delta_callback:
+                        try:
+                            agent.stream_delta_callback(final_response)
+                            agent.stream_delta_callback(None)
+                        except Exception:
+                            pass
+                    agent._cleanup_task_resources(effective_task_id)
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": final_response,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "partial": True,
+                        "error": f"repetition_guard_halt: {_rep_decision.kind}",
+                    }
+
                 # If this turn has both content AND tool_calls, capture the content
                 # as a fallback final response. Common pattern: model delivers its
                 # answer and calls memory/skill tools as a side-effect in the same
@@ -7234,6 +7307,20 @@ def run_conversation(
                             except Exception:
                                 pass
                     break
+
+                # First duplicate (occurrence 2): the tool call(s) above
+                # already ran -- rewriting history to skip them would lose
+                # real side effects -- but inject the one-line corrective
+                # nudge now so the NEXT completion call sees it. Per the
+                # calibration principle this is a single plain sentence,
+                # not a repeated boilerplate block.
+                if _rep_decision.should_warn:
+                    messages.append({
+                        "role": "user",
+                        "content": _rep_decision.message,
+                        "_repetition_guard_synthetic": True,
+                    })
+                    agent._session_messages = messages
 
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the

@@ -146,6 +146,19 @@ DEFAULT_CONFIG = {
         # (force on/off for all models), or a list of model-name substrings
         # to match (e.g. ["gpt", "codex", "gemini", "qwen"]).
         "tool_use_enforcement": "auto",
+        # Ornith derail case-study fix F1 (2026-07-29): a local seat under
+        # retrieval pressure re-converges to its last known-good text and
+        # repeats it verbatim. Detects an assistant turn (text or tool call)
+        # that is an exact/near-exact duplicate of the immediately preceding
+        # one. First duplicate -> one corrective line is injected; second
+        # consecutive duplicate -> halt the tool loop for that turn (mirrors
+        # the kernel agent loop's no-progress guard, limit 3).
+        "assistant_repetition_guard": {
+            "enabled": True,
+            "warn_after": 2,   # occurrences (2 = first duplicate)
+            "halt_after": 3,   # occurrences (3 = second consecutive duplicate)
+            "near_duplicate_threshold": 0.92,  # normalized similarity ratio
+        },
         # Intent-ack continuation: when the model opens a turn by narrating an
         # action it will take ("I'll go check the logs...") but emits no tool
         # call, intercept the turn-end, inject a "continue now, execute the
