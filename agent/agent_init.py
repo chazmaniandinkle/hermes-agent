@@ -491,6 +491,62 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _small_model_mitigations_default(agent) -> bool:
+    """Default for the Ornith derail mitigations (F3 tool-inventory pinning,
+    F4 frame re-anchor).
+
+    Both were added for one observed failure mode: a small local model, under
+    heavy retrieval load, losing track of its own tool inventory or letting a
+    long tool result's discourse displace the live user question. The fix is
+    cheap but not free -- F3 appends a names-only tool list to the *last
+    message whatever its role* on every turn, and F4 appends a restatement of
+    the user's question inside a tool-result envelope. On a frontier hosted
+    model that never exhibits the failure, that is undeclared text added to
+    the wire every turn, including text nested inside tool output where it can
+    read as instruction rather than data.
+
+    Returns False (mitigations off by default) for frontier hosted providers,
+    True otherwise -- preserving the previous behaviour for local/unknown
+    backends, which are the ones the mitigations were written for.
+
+    This only sets the DEFAULT. An explicit ``agent.tool_inventory_pinning.
+    enabled`` / ``agent.frame_reanchor.enabled`` in config always wins.
+    """
+    frontier_providers = {
+        "anthropic",
+        "openai",
+        "google",
+        "gemini",
+        "xai",
+        "groq",
+        "deepseek",
+        "mistral",
+    }
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    if provider in frontier_providers:
+        return False
+
+    # openrouter and similar aggregators front many models; treat a
+    # non-local base_url plus a known frontier model family as frontier.
+    base_url = str(getattr(agent, "base_url", "") or "").strip().lower()
+    is_local_endpoint = any(
+        marker in base_url
+        for marker in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+    )
+    if is_local_endpoint:
+        return True
+
+    model = str(getattr(agent, "model", "") or "").strip().lower()
+    frontier_model_markers = (
+        "claude", "gpt-4", "gpt-5", "gpt5", "o1-", "o3-", "o4-",
+        "gemini", "grok", "deepseek", "mistral-large",
+    )
+    if any(marker in model for marker in frontier_model_markers):
+        return False
+
+    return True
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -1773,10 +1829,23 @@ def init_agent(
     # long retrieval's own discourse can't displace the actual conversation
     # ("frame capture" -- see agent.tool_dispatch_helpers.make_tool_result_
     # message).
+    #
+    # Model-class gate (myrgic PATCH): F3/F4 are mitigations for a specific
+    # small-model failure -- attention-under-pressure on long retrievals,
+    # observed on a local model that denied having a tool it had just used.
+    # Frontier hosted models do not exhibit it, so applying the mitigation
+    # there is pure cost: undeclared bytes appended to every turn, and a
+    # tool-result envelope that ends up carrying text the model can mistake
+    # for instructions. Explicit config always wins; this only moves the
+    # *default* for models that demonstrably don't need it.
+    _mitigation_default = _small_model_mitigations_default(agent)
+
     _frame_reanchor_cfg = _agent_cfg.get("frame_reanchor", {}) or {}
     if not isinstance(_frame_reanchor_cfg, dict):
         _frame_reanchor_cfg = {}
-    agent._frame_reanchor_enabled = bool(_frame_reanchor_cfg.get("enabled", True))
+    agent._frame_reanchor_enabled = bool(
+        _frame_reanchor_cfg.get("enabled", _mitigation_default)
+    )
     try:
         agent._frame_reanchor_threshold_bytes = int(
             _frame_reanchor_cfg.get("threshold_bytes", 4096) or 4096
@@ -1790,7 +1859,9 @@ def init_agent(
     _tool_pin_cfg = _agent_cfg.get("tool_inventory_pinning", {}) or {}
     if not isinstance(_tool_pin_cfg, dict):
         _tool_pin_cfg = {}
-    agent._tool_inventory_pinning_enabled = bool(_tool_pin_cfg.get("enabled", True))
+    agent._tool_inventory_pinning_enabled = bool(
+        _tool_pin_cfg.get("enabled", _mitigation_default)
+    )
 
     # Ornith derail case-study fix F2: truncation-continuation mode.
     # "prefill" resends the truncated text as a trailing assistant turn
