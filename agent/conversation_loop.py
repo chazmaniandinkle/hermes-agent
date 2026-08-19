@@ -2255,7 +2255,7 @@ def run_conversation(
             # content itself (the actual corrective line) is sent as-is.
             api_msg.pop("_repetition_guard_synthetic", None)
             # Strip internal F2 length-truncation-prefill marker (see
-            # agent.repetition_guard's neighbor, the Ornith derail fixes)
+            # agent.turn_repetition_guard's neighbor, the Ornith derail fixes)
             api_msg.pop("_length_truncation_prefill", None)
             # Strip Codex Responses API fields (call_id, response_item_id) for
             # strict providers like Mistral, Fireworks, etc. that reject unknown fields.

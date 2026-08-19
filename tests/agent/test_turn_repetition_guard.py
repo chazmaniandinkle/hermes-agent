@@ -3,7 +3,7 @@
 The guard is pure/stateless: every decision is derived from the tail of
 the ``messages`` transcript, not an in-memory counter, because gateway
 sessions rebuild the ``AIAgent`` fresh every turn (see module docstring in
-agent/repetition_guard.py for why an instance-level counter would silently
+agent/turn_repetition_guard.py for why an instance-level counter would silently
 reset and miss the exact cross-turn repetition this guard exists to catch).
 """
 
