@@ -164,7 +164,13 @@ DEFAULT_CONFIG = {
         # user question so a long retrieval's own discourse doesn't displace
         # the actual conversation ("frame capture").
         "frame_reanchor": {
-            "enabled": True,
+            # ``enabled: None`` means AUTO -- defer to the model-class gate in
+            # ``agent.agent_init._small_model_mitigations_default()`` (myrgic
+            # PATCH-016, second commit). A hardcoded ``True`` here silently defeated
+            # that gate: ``.get("enabled", gate_default)`` always found this explicit
+            # key, so the gate's default was never consulted and the mitigation ran
+            # on frontier models regardless. Set True/False to force the feature.
+            "enabled": None,
             "threshold_bytes": 4096,
         },
         # Ornith derail case-study fix F3 (2026-07-29): re-inject a compact
@@ -173,7 +179,8 @@ DEFAULT_CONFIG = {
         # only in the system prompt (primacy) can get "forgotten" after enough
         # retrieval volume; a cheap recency copy keeps it live.
         "tool_inventory_pinning": {
-            "enabled": True,
+            # ``enabled: None`` = AUTO, same model-class gate as frame_reanchor above.
+            "enabled": None,
         },
         # Ornith derail case-study fix F2 (2026-07-29): how Hermes asks a model
         # to finish a response cut off by the output length limit. "prefill"

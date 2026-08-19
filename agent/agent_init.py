@@ -1840,12 +1840,24 @@ def init_agent(
     # *default* for models that demonstrably don't need it.
     _mitigation_default = _small_model_mitigations_default(agent)
 
+    def _resolve_mitigation_flag(cfg: dict, key: str = "enabled") -> bool:
+        """Resolve an F3/F4 enable flag, honouring the AUTO sentinel.
+
+        ``None`` (the shipped DEFAULT_CONFIG value) means AUTO: defer to the
+        model-class gate. Only a genuinely explicit True/False in user config
+        overrides it. Reading with ``.get(key, default)`` alone is NOT enough
+        -- ``load_config()`` merges DEFAULT_CONFIG in, so the key is always
+        present and the gate default would never be consulted.
+        """
+        value = cfg.get(key, None)
+        if value is None:
+            return _mitigation_default
+        return bool(value)
+
     _frame_reanchor_cfg = _agent_cfg.get("frame_reanchor", {}) or {}
     if not isinstance(_frame_reanchor_cfg, dict):
         _frame_reanchor_cfg = {}
-    agent._frame_reanchor_enabled = bool(
-        _frame_reanchor_cfg.get("enabled", _mitigation_default)
-    )
+    agent._frame_reanchor_enabled = _resolve_mitigation_flag(_frame_reanchor_cfg)
     try:
         agent._frame_reanchor_threshold_bytes = int(
             _frame_reanchor_cfg.get("threshold_bytes", 4096) or 4096
@@ -1859,9 +1871,7 @@ def init_agent(
     _tool_pin_cfg = _agent_cfg.get("tool_inventory_pinning", {}) or {}
     if not isinstance(_tool_pin_cfg, dict):
         _tool_pin_cfg = {}
-    agent._tool_inventory_pinning_enabled = bool(
-        _tool_pin_cfg.get("enabled", _mitigation_default)
-    )
+    agent._tool_inventory_pinning_enabled = _resolve_mitigation_flag(_tool_pin_cfg)
 
     # Ornith derail case-study fix F2: truncation-continuation mode.
     # "prefill" resends the truncated text as a trailing assistant turn

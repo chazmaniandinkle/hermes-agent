@@ -64,10 +64,17 @@ def _tool_result_message_kwargs(agent, messages: list) -> dict:
     live question" from the transcript itself rather than threading a
     variable through several call frames, so it stays correct even when
     the re-anchor fires several tool-call iterations after the user
-    actually spoke. Both features fail open (no-op) if the agent lacks the
-    attributes, e.g. lightweight test doubles.
+    actually spoke.
+
+    The re-anchor fails CLOSED (myrgic PATCH-016, second commit): if the
+    agent lacks ``_frame_reanchor_enabled``, no construction path ever made
+    an explicit decision about it, so the feature is OFF. Note the inverted
+    test below -- an absent attribute yields ``False``, so ``not False`` is
+    True and ``reanchor_question`` is cleared, i.e. no re-anchor text is
+    nested inside the tool-result envelope. Never append undeclared text to
+    a tool result by default; it is indistinguishable from injection.
     """
-    if not getattr(agent, "_frame_reanchor_enabled", True):
+    if not getattr(agent, "_frame_reanchor_enabled", False):
         reanchor_question = None
     else:
         reanchor_question = find_last_user_message_text(messages) or None

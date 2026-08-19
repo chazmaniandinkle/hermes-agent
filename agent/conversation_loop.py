@@ -2439,7 +2439,13 @@ def run_conversation(
         # specific attention-under-pressure failure. Appended to the last
         # message's own content (not a new message) so it can't disturb
         # role-alternation-strict providers.
-        if getattr(agent, "_tool_inventory_pinning_enabled", True):
+        # Fail CLOSED (myrgic PATCH-016, second commit): an absent attribute
+        # means no agent-construction path ever made an explicit decision
+        # about this feature. Undeclared text must never be appended to the
+        # wire by default -- F3's append lands in whatever message is last,
+        # tool results included, which makes it indistinguishable from a
+        # hostile injection. Absent attribute => feature OFF.
+        if getattr(agent, "_tool_inventory_pinning_enabled", False):
             _pin_line = _build_tool_inventory_pin(agent.tools)
             if _pin_line and api_messages:
                 _last_api_msg = api_messages[-1]
