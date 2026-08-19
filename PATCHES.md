@@ -24,10 +24,19 @@ Lives on the `local` branch. Read before editing any file under "Files to Watch.
 - **Resync cadence:** ad hoc, triggered by drift audits or triage sessions (most recent:
   2026-06-10, 2026-07-04) — not yet on a fixed schedule. Each resync re-verifies every open
   upstream-track item and re-runs the affected test suites.
-- **Identity rule:** PATCH-xxx / EXT-xxx numbers are identity-referenced and **never reused or
-  renumbered** once assigned, even if the underlying commit is dropped, superseded, or the number
-  briefly collided with other same-day work (see PATCH-013/014's numbering note below). Categorize
-  and re-categorize freely via sections and metadata; the ID itself is permanent.
+- **Identity rule:** a patch is identified by its **slug** — a short kebab-case name describing
+  what the patch *does* (`oauth-sanitizer-anchoring`, not `PATCH-017`). Same convention as this
+  workspace's ADRs. A slug is permanent once assigned: never reused, never renamed, even if the
+  underlying commit is dropped or superseded. Categorize freely via sections and metadata; the
+  slug itself does not move.
+  - **Why slugs, not numbers:** a number is an indirection — you must open the registry to learn
+    what `PATCH-011` is. A slug resolves at the pointer. Numbers also invited collisions
+    (two items briefly shared "PATCH-005"; the OAuth Gate 2 work was renumbered 013→014 mid-flight)
+    and the conformance probe for `PATCH-013` was *filed under the name* `GATE-2.py` — the registry
+    ID and the probe name had already drifted apart.
+  - **Legacy-ID:** each entry retains its old number in a `Legacy-ID` field. Earlier commit
+    messages, `PATCHES.md` prose, and a public upstream GitHub comment cite those numbers; the
+    field keeps that provenance resolvable. New patches get a slug and no number.
 
 ---
 
@@ -52,13 +61,13 @@ This node runs **one gateway process per agent profile**, each a separate launch
 ## Section index
 
 - [UPSTREAM-TRACK](#upstream-track) — patches whose end state is an upstream PR/comment; four sub-states track exactly where each sits:
-  - FILED-OPEN — PR already filed, open, unmerged (PATCH-006, -009, -010, -012)
-  - READY-TO-FILE — draft complete, held pending operator go (PATCH-014)
-  - NEEDS-WORK-TO-FILE — real candidate, blocked on local work before submission (PATCH-013; PATCH-007+008 joint; EXT-005; PATCH-015)
-  - COMMENT-DONT-FILE — real bug, but competing upstream PRs already cover the surface (PATCH-011)
-- [LOCAL-PERMANENT](#local-permanent) — site-specific, no generic upstream audience, will never be filed (PATCH-002, -004, EXT-001-Gate1-note, EXT-002/003/004/007/008/009/010)
-- [DELIBERATE-DIVERGENCE](#deliberate-divergence) — upstream has a stance (shipped a lighter fix, or has no equivalent by design) that this repo has knowingly chosen not to follow (PATCH-001 + its xfail test-deltas, EXT-001-Gate2)
-- [ABSORBED-BY-UPSTREAM](#absorbed-by-upstream) — historical; upstream shipped the equivalent, patch dropped out at rebase (PATCH-003, Gate 1 of `da816abe5`)
+  - FILED-OPEN — PR already filed, open, unmerged (`tts-concurrent-output-collision`, `steer-slash-alias`, `restart-ack-teardown-race`, `cron-teardown-orphan-race`)
+  - READY-TO-FILE — draft complete, held pending operator go (`idle-triggered-background-review`)
+  - NEEDS-WORK-TO-FILE — real candidate, blocked on local work before submission (`oauth-gate2-identity-relocation`; `oauth-credential-read-only` joint; `skill-relevance-gate-plugin`; `ornith-derail-tier1-fixes`)
+  - COMMENT-DONT-FILE — real bug, but competing upstream PRs already cover the surface (`sessiondb-write-none-guard`, `oauth-sanitizer-anchoring`)
+- [LOCAL-PERMANENT](#local-permanent) — site-specific, no generic upstream audience, will never be filed (`untracked-test-and-skill-residue`, `myrgic-overlay-header`, `oauth-billing-gate-gate1-note`, `mod3-session-plugin`, `mod3-voice-plugin`, `bw-bridge-plugin`, `auto-voice-reply-hook`, `bw-eclipse-key-hook`, `mod3-voice-bootstrap-hook`, `claude-token-refresh-actuator`)
+- [DELIBERATE-DIVERGENCE](#deliberate-divergence) — upstream has a stance (shipped a lighter fix, or has no equivalent by design) that this repo has knowingly chosen not to follow (`progressive-memory-eviction` + its xfail test-deltas, `oauth-billing-gate-gate2`)
+- [ABSORBED-BY-UPSTREAM](#absorbed-by-upstream) — historical; upstream shipped the equivalent, patch dropped out at rebase (`launchd-restart-detection`, Gate 1 of `da816abe5`)
 - [Files to Watch](#files-to-watch-upstream-changes-here-may-break-a-patch-or-plugin)
 - [User-Space Extensions](#user-space-extensions-safe--outside-this-repo-survive-any-reset) index
 - [History](#history)
@@ -72,7 +81,8 @@ tracks exactly where each one sits in that pipeline.
 
 ### FILED-OPEN — PR already filed, open, unmerged
 
-#### PATCH-006: TTS concurrent output path collision (`tools/tts_tool.py`)
+#### `tts-concurrent-output-collision`: TTS concurrent output path collision (`tools/tts_tool.py`)
+- **Legacy-ID:** `PATCH-006` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** LIVE on `local`, replayed clean at the 2026-07-04 resync (single-line change, no conflict).
 - **Files:** `tools/tts_tool.py` (1 line)
 - **What:** `text_to_speech_tool` named output files `tts_<YYYYMMDD_HHMMSS>.<fmt>` — second-level precision. Concurrent `/api/audio/speak` requests in the same second collided on one path and raced: one unlinked the file mid-write of another → "TTS provider produced no output" errors (observed with the mod3 command provider during desktop voice playback). Fix adds `%f` (microseconds) to the strftime format so concurrent calls get unique paths.
@@ -82,7 +92,8 @@ tracks exactly where each one sits in that pipeline.
 - **Re-merge-risk:** LOW — additive precision on a filename, no behavior change otherwise.
 - **Reconciler action:** ping the PR on the next reconciler sweep; drops out at rebase when #43911 merges.
 
-#### PATCH-009: `/s` alias for `/steer` (`ui-tui/src/app/slash/commands/core.ts`)
+#### `steer-slash-alias`: `/s` alias for `/steer` (`ui-tui/src/app/slash/commands/core.ts`)
+- **Legacy-ID:** `PATCH-009` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local`. **Live after `npm run build` in `ui-tui/` + TUI relaunch.**
 - **Files:** `ui-tui/src/app/slash/commands/core.ts` (one line: `aliases: ['s']` on the `steer` command).
 - **What:** Adds `s` as a short alias for the TUI `/steer` slash command (inject a message after the next tool call without interrupting). Uses the existing `aliases?: string[]` field on `SlashCommand` — `registry.ts` already flat-maps `[cmd.name, ...cmd.aliases]` into the command lookup, so no dispatch change needed.
@@ -92,7 +103,8 @@ tracks exactly where each one sits in that pipeline.
 - **Test-delta notes:** `slashParity.test.ts` 3/3 pass; `npm run build` clean (2.9mb bundle); alias confirmed compiled into `dist/entry.js`.
 - **Re-merge-risk:** trivially re-appliable; drops out at rebase when #43912 merges.
 
-#### PATCH-010: `/restart` ack lost to teardown race (`gateway/platforms/base.py`, `gateway/run.py`)
+#### `restart-ack-teardown-race`: `/restart` ack lost to teardown race (`gateway/platforms/base.py`, `gateway/run.py`)
+- **Legacy-ID:** `PATCH-010` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local`. **Adapted at the 2026-07-04 resync** — upstream independently rewrote `cancel_background_tasks` with a bounded 5s hard-cancel + `MAX_DRAIN_ROUNDS` retry-loop (for late-arriving tasks during drain — a related but distinct problem) and refactored the call sites in `gateway/run.py` into a shared `_bounded_adapter_teardown(adapter, platform, *, profile=None)` helper. Adaptation: `grace_seconds` param added to both `cancel_background_tasks` and to `_bounded_adapter_teardown` itself. **Live after each gateway restart.**
 - **Files:** `gateway/platforms/base.py` (`cancel_background_tasks` gains `grace_seconds=0.0`), `gateway/run.py` (`_bounded_adapter_teardown` gains `grace_seconds=0.0` and forwards it; both call sites in `_stop_impl` pass `grace_seconds=2.0 if self._restart_requested else 0.0`), `tests/gateway/test_restart_ack_grace.py` (3 tests).
 - **What:** The `/restart` handler queues its ack ("♻ Restarting gateway...") and `request_restart` begins `stop()` 50ms later. With no active agents the drain phase is instant, and `cancel_background_tasks()` cancelled the in-flight `_process_message_background` task mid-HTTPS-send — `CancelledError` propagates silently (no failure log, no retry), so the ack never reached the chat. Observed 3/3 on 2026-06-10 (20:46, 21:38, 21:39). Fix gives in-flight tasks a bounded grace window (2s, restart path only) to finish naturally before cancellation; plain stops are unchanged. The ack's text is the recovery instruction for the PATCH-003 failure mode — the race ate the one message telling the operator what to do when the gateway bricks.
@@ -102,7 +114,8 @@ tracks exactly where each one sits in that pipeline.
 - **Re-merge-risk:** LOW — additive default-off parameter; only the planned-restart path changes timing (≤2s slower teardown when a send is in flight).
 - **Reconciler action:** watch `cancel_background_tasks` and `_bounded_adapter_teardown` for further churn; drop if upstream adds an equivalent flush-before-cancel.
 
-#### PATCH-012: cron inactivity-timeout teardown races the orphaned worker (`cron/scheduler.py`)
+#### `cron-teardown-orphan-race`: cron inactivity-timeout teardown races the orphaned worker (`cron/scheduler.py`)
+- **Legacy-ID:** `PATCH-012` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local`. **Rebased 2026-07-04**: conflict was a pure positional collision, not functional overlap — upstream independently added an unrelated `_guard_job_credential_exfil` security-guard function at the same insertion point where PATCH-012's `_teardown_cron_job_resources` was inserted. Resolved as sibling module-level functions; rest of the diff auto-merged clean. **Live after each gateway restart** (editable install — `cron/scheduler.py` imports straight from this checkout).
 - **Files:** `cron/scheduler.py` (+172/−39): new module-level `_teardown_cron_job_resources` helper; `_cron_future = None` pre-bind before the job `try:`; `process_registry.kill_all(task_id=_cron_session_id)` added to the inactivity-timeout branch; `finally:` session-db/agent teardown rewired through the helper.
 - **What:** After an inactivity timeout, `_run_job_impl`'s `finally:` closed `_session_db` and called `agent.close()` while the timed-out job's worker thread was still executing — `ThreadPoolExecutor.shutdown(wait=False, cancel_futures=True)` cannot stop a running future. `agent.close()`'s `kill_all` then unblocked the stuck tool, and the resumed worker's `_flush_messages_to_session_db` hit the closed connection, silently dropping the turn's rows. Fix: the timeout branch does the subprocess kill itself (keeps the unblock behavior); teardown ownership transfers to the future via `add_done_callback` (close runs on the worker thread after its final writes land); a daemon `Timer` (`HERMES_CRON_TEARDOWN_HARDCAP`, default 900s) bounds the deferral so a worker that never finishes cannot leak the SQLite handle/subprocesses/sockets forever.
@@ -116,7 +129,8 @@ tracks exactly where each one sits in that pipeline.
 
 ### READY-TO-FILE — draft complete, held pending operator go
 
-#### PATCH-014: Idle-triggered background self-improvement review (`agent/background_review.py`, `run_agent.py`, `hermes_cli/config.py`)
+#### `idle-triggered-background-review`: Idle-triggered background self-improvement review (`agent/background_review.py`, `run_agent.py`, `hermes_cli/config.py`)
+- **Legacy-ID:** `PATCH-014` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local` (this commit). **Live after each gateway restart.**
 - **Numbering note:** the 2026-07-04 triage dispatch referred to this work as "PATCH-013" before the same-day resync consumed that number for the OAuth Gate 2 entry (see DELIBERATE-DIVERGENCE below). Per the identity-collision rule (chronologically-first-and-already-drafted wins, then cascade), this work was renumbered **PATCH-014** in the registry; the working-notes files keep their original `patch013-*` filenames (`~/workspaces/cog/.cog/mem/working/2026-07-04-hermes-triage/fixes/patch013-notes.md`) — a deliberate exception to renumbering-cascade since those are working files, not identity-referenced registry entries.
 - **Files:** `agent/background_review.py` (+~250: `IdleReviewScheduler`, `_idle_trigger_config`, `get_idle_review_scheduler`, `note_foreground_turn_start/end` — additive section at end of module), `run_agent.py` (`_spawn_background_review` becomes a dispatcher; old body renamed `_spawn_background_review_now`; `run_conversation` forwarder gains turn-start/turn-end activity stamps in a try/finally; `close()` step 0 + `release_clients()` cancel the scheduler), `hermes_cli/config.py` (defaults `auxiliary.background_review.idle_trigger_seconds: 0`, `coalesce: true`), `tests/run_agent/test_background_review_idle_trigger.py` (13 tests, new).
@@ -132,7 +146,8 @@ tracks exactly where each one sits in that pipeline.
 
 ### NEEDS-WORK-TO-FILE — real upstream candidate, blocked on local work before submission
 
-#### PATCH-013: OAuth Gate 2 — relocate agent identity out of `system` field (`agent/anthropic_adapter.py`)
+#### `oauth-gate2-identity-relocation`: OAuth Gate 2 — relocate agent identity out of `system` field (`agent/anthropic_adapter.py`)
+- **Legacy-ID:** `PATCH-013` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local` (newly numbered at the 2026-07-04 resync; previously untracked as a discrete PATCH-ID — it rode inside `da816abe5` alongside the now-upstreamed Gate 1 tool-prefix fix, see ABSORBED-BY-UPSTREAM below).
 - **Files:** `agent/anthropic_adapter.py` (`_relocate_identity_into_first_user` helper + the `is_oauth` branch of `build_anthropic_kwargs`).
 - **What:** The OAuth system-content classifier routes a request to the metered overage lane when the `system` field carries a large agent identity block (memory/skill/boundaries markers), even with zero tools. Relocates that identity into the first user turn — the way Claude Code injects `CLAUDE.md` — leaving only the canonical Claude Code system string in `system`. Block-order safe: if the first user turn leads with a `tool_result` block, the identity is appended after it.
@@ -144,10 +159,12 @@ tracks exactly where each one sits in that pipeline.
 - **Re-merge-risk:** the file's `is_oauth` branch and `convert_messages_to_anthropic` (upstream's message-history normalization runs BEFORE this patch's relocation call) are the two watch points for future upstream churn.
 - **Reconciler action:** close the cache-control gap, then file as a narrowly-scoped PR; watch `agent/anthropic_adapter.py`'s `build_anthropic_kwargs` `is_oauth` branch for churn in the meantime.
 
-#### PATCH-007 + PATCH-008 (joint): Claude Code OAuth credential is read-only (`agent/credential_pool.py`, `agent/anthropic_adapter.py`)
+#### `oauth-credential-read-only` (joint): Claude Code OAuth credential is read-only (`agent/credential_pool.py`, `agent/anthropic_adapter.py`)
+- **Legacy-ID:** `PATCH-007` (pre-slug registry number; cited by earlier commits and upstream refs)
 Filed together — same contract, same companion actuator, one PR narrative.
 
-##### PATCH-007 — `agent/credential_pool.py`
+##### `oauth-credential-read-only-pool` — `agent/credential_pool.py`
+- **Legacy-ID:** `PATCH-007` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local`. **Rebased 2026-07-04** onto upstream's independently-added `openai-codex`-specific serialization branch (`_refresh_entry` split into a dispatcher + `_refresh_entry_impl`) — real conflict, resolved by placing PATCH-007's `anthropic`/`claude_code` early-return branch in the dispatcher ahead of the codex branch. Verified: all 101 tests across `test_credential_pool.py` + `test_credential_pool_routing.py` + `test_credential_pool_oauth_writethrough.py` pass, 0 regressions. **Live after each gateway restart.**
 - **Files:** `agent/credential_pool.py` (`_refresh_entry`, +~30 lines, additive branch at top)
 - **Companion (user-space, EXT-010):** `~/.hermes/bin/claude-token-refresh` — the actuator.
@@ -157,7 +174,8 @@ Filed together — same contract, same companion actuator, one PR narrative.
 - **Test-delta notes:** module compiles + imports in venv; unit test (POST sentinel raises if touched) confirms all three paths — fresh / owner-refreshed / revoked — never POST the refresh token.
 - **Interaction note:** EXT-001 `oauth_billing_gate` monkeypatches `agent/anthropic_adapter.py` (outbound billing/routing) — orthogonal to this pool-refresh gate, no shared symbol.
 
-##### PATCH-008 — `agent/anthropic_adapter.py`
+##### `oauth-credential-read-only-adapter` — `agent/anthropic_adapter.py`
+- **Legacy-ID:** `PATCH-008` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local`. **Highest-risk re-merge of the 2026-07-04 resync** — manually re-applied onto upstream's own OAuth-credential hardening (`1dde7e2f2`/`5a5396aec`), which added a race-*mitigation* "adopt already-refreshed token" fast path but still falls through to a direct POST + file write when no fresher credential is found. Kept upstream's fast path (strictly better, free); routed the fallback through the EXT-010 actuator instead of upstream's POST. `_write_claude_code_credentials` stays a hard no-op. **Live after each gateway restart.**
 - **Files:** `agent/anthropic_adapter.py` (`_refresh_oauth_token` → read-only actuator delegation; `_write_claude_code_credentials` → no-op). Tests: `tests/agent/test_anthropic_adapter.py` (`TestRefreshOauthToken`, `TestWriteClaudeCodeCredentials`), `tests/agent/test_auxiliary_client.py` (force-refresh test rewritten to assert the read-only contract).
 - **Companion:** EXT-010 actuator `~/.hermes/bin/claude-token-refresh` (shared with PATCH-007).
@@ -170,7 +188,8 @@ Filed together — same contract, same companion actuator, one PR narrative.
 
 **Joint reconciler action:** fix PATCH-008's stale keychain test first, then file one PR covering both patches as a single strict-read-only-contract change.
 
-#### EXT-005: `skill_relevance_gate` plugin — pending site-specificity check
+#### `skill-relevance-gate-plugin`: `skill_relevance_gate` plugin — pending site-specificity check
+- **Legacy-ID:** `EXT-005` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Location:** `~/.hermes/plugins/skill_relevance_gate/` (user-space, safe from `git reset`).
 - **What:** Filters skill *loading* by relevance to the current task, to reduce irrelevant skill-context injection.
 - **Provenance:** Predates the 2026-06-03 registry (its test file, `tests/plugins/test_skill_relevance_gate.py`, is one of the two items tracked as PATCH-002's untracked residue). No incident record recovered.
@@ -179,7 +198,8 @@ Filed together — same contract, same companion actuator, one PR narrative.
 - **Re-merge-risk:** N/A — user-space plugin, outside the tracked repo.
 - **Reconciler action:** second-highest-value genuinely-novel candidate in the registry after PATCH-014, but lower urgency (no open issue demanding it) — file after the site-specificity audit.
 
-#### PATCH-015: Ornith derail Tier-1 fixes — repetition guard, frame re-anchor, tool pinning, prefill continuation, fence-once (`agent/turn_repetition_guard.py`, `agent/conversation_loop.py`, `agent/tool_dispatch_helpers.py`, `agent/tool_executor.py`, `agent/agent_init.py`, `agent/turn_context.py`, `hermes_cli/config.py`)
+#### `ornith-derail-tier1-fixes`: Ornith derail Tier-1 fixes — repetition guard, frame re-anchor, tool pinning, prefill continuation, fence-once (`agent/turn_repetition_guard.py`, `agent/conversation_loop.py`, `agent/tool_dispatch_helpers.py`, `agent/tool_executor.py`, `agent/agent_init.py`, `agent/turn_context.py`, `hermes_cli/config.py`)
+- **Legacy-ID:** `PATCH-015` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local`, 5 commits (`e93caa32d`..`64c6f74fb`).
 - **What:** Five harness-level fixes for local-model failure classes surfaced by a single 39-message Hermes-darkstar session (`20260729_163715_1b99fd1a`, first cross-node LMS use): (1) **F1** assistant repetition guard — new `agent/turn_repetition_guard.py` (renamed 2026-08-19 from `repetition_guard.py`; see PATCH-018), stateless detector comparing an about-to-be-emitted assistant turn (text, or the tool-call set) against the immediately preceding one; first duplicate injects a corrective line, second consecutive duplicate halts the tool loop; mirrors the kernel agent loop's no-progress guard. (2) **F4** frame re-anchor — after a tool result over 4KB, appends one line naming the live user question so a long retrieval's own discourse can't displace the actual conversation. (3) **F3** tool inventory pinning — re-injects a compact tool-name-only list at the very end of context assembly each turn (recency beats primacy for small models). (4) **F2** truncation continuation switched from an instructional "continue exactly where you left off" nudge (observed producing a restart from the top) to mechanical prefill — resend with the truncated text as a trailing assistant turn, same mechanism this codebase already uses for thinking-only-response recovery. (5) fence-once-per-turn — the `<untrusted_tool_result>` instructional paragraph now fires once per turn (full fence) with a one-word `<untrusted/>` tag on subsequent results, instead of repeating the ~50-token paragraph on every result.
 - **New config sections** (profile `config.yaml`): `assistant_repetition_guard`, `frame_reanchor`, `tool_inventory_pinning`, `truncation_continuation` — all default-on with the behavior above.
@@ -189,7 +209,8 @@ Filed together — same contract, same companion actuator, one PR narrative.
 - **NEEDS-WORK gap:** no upstream search done yet for prior art on any of the five; the tool-call-repetition mirror (folded into F1, capped at warn-only to avoid racing `tool_guardrails.py`'s existing, more leniently-tuned halt thresholds) needs its interaction with that existing guardrail called out explicitly in any upstream PR description, since a reviewer familiar with `tool_guardrails.py` will ask why there are now two overlapping mechanisms.
 - **Reconciler action:** search upstream for repetition-guard / prefill-continuation / context-recency prior art before filing; if none exists, this is a strong, self-contained PR candidate (no Myrgic-specific coupling).
 
-#### PATCH-016: Model-class gate for the F3/F4 Ornith mitigations (`agent/agent_init.py`)
+#### `ornith-model-class-gate`: Model-class gate for the F3/F4 Ornith mitigations (`agent/agent_init.py`)
+- **Legacy-ID:** `PATCH-016` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local`. Amends PATCH-015 (does not revert it).
 - **Files:** `agent/agent_init.py` — new module-level helper `_small_model_mitigations_default(agent)`; the `frame_reanchor.enabled` and `tool_inventory_pinning.enabled` reads now use it as their **default** instead of a hardcoded `True`.
 - **What:** PATCH-015 shipped F3 (tool-inventory pinning) and F4 (frame re-anchor) **default-on for every model and provider**. Both were written for one observed failure: a small *local* model under heavy retrieval load denying it had a tool it had just used four times. On a frontier hosted model the failure class does not occur, so the mitigation is pure cost — F3 appends a names-only tool list (~600 B, 51 names on this profile) to `api_messages[-1]` **whatever that message's role is**, every turn; F4 appends a restatement of the live user question *inside a tool-result envelope*. The gate returns `False` (mitigations off) for known frontier providers, or for a non-local `base_url` whose model matches a frontier family marker; returns `True` (previous behaviour, unchanged) for local endpoints (`localhost`/`127.0.0.1`/`0.0.0.0`/`::1`) and anything unrecognised. **Explicit config always wins** — this only moves the default.
@@ -201,7 +222,8 @@ Filed together — same contract, same companion actuator, one PR narrative.
 
 ### COMMENT-DONT-FILE — real bug, but competing upstream PRs already cover the surface
 
-#### PATCH-018: Rename `agent/repetition_guard.py` → `agent/turn_repetition_guard.py` (collision avoidance)
+#### `turn-repetition-guard-rename`: Rename `agent/repetition_guard.py` → `agent/turn_repetition_guard.py` (collision avoidance)
+- **Legacy-ID:** `PATCH-018` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local`. Pure rename + import updates; **no behaviour change**. Never file upstream — this exists only to make our rebase survivable.
 - **Files:** `agent/repetition_guard.py` → `agent/turn_repetition_guard.py`; `tests/agent/test_repetition_guard.py` → `tests/agent/test_turn_repetition_guard.py`; import sites in `agent/conversation_loop.py`, `agent/agent_init.py`.
 - **What:** both sides created a file at `agent/repetition_guard.py` **after** the 2026-07-04 merge-base, with **disjoint purpose**. Upstream (`b48ab1b4ad`, issue #86581, 95 lines, 2 functions) detects verbatim repetition *within a single truncated fragment* on the `finish_reason=length` continuation path — the incident was one turn emitting 60,698 chars as 31 Discord messages. Ours (PATCH-015 F1, 301 lines) detects near-duplicate repetition *across consecutive assistant turns*, plus tool-call-set repetition, and halts the tool loop. Same filename, unrelated mechanisms; neither should win.
@@ -210,7 +232,8 @@ Filed together — same contract, same companion actuator, one PR narrative.
 - **Upstream refs:** none, and none wanted. If PATCH-015/F1 is ever filed upstream it must be filed under the new name, with #86581's guard explicitly called out as a *neighbour, not a duplicate* — a reviewer who knows #86581 will otherwise assume overlap.
 - **Reconciler action:** keep. Re-check at each resync that upstream still owns `agent/repetition_guard.py`; if upstream ever deletes it, this rename can be reverted but there is no reason to.
 
-#### PATCH-017: OAuth sanitizer must not rewrite `hermes-agent` inside paths/URLs (`agent/anthropic_adapter.py`)
+#### `oauth-sanitizer-anchoring`: OAuth sanitizer must not rewrite `hermes-agent` inside paths/URLs (`agent/anthropic_adapter.py`)
+- **Legacy-ID:** `PATCH-017` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local`. Adopts upstream PR #48868's regex **verbatim** so the eventual merge rebases to a no-op.
 - **Files:** `agent/anthropic_adapter.py` (`import re`; the `is_oauth` sanitizer loop at ~L2542) + `tests/agent/test_anthropic_adapter.py` (new `TestOAuthSanitizerSlugPreservation`, 6 tests).
 - **What:** the OAuth branch ran `identity_text.replace("hermes-agent", "claude-code")` — an unanchored substring replace over the **entire assembled system prompt**, intended only to launder product names past Anthropic's OAuth content classifier. It has no notion that `hermes-agent` is also a directory on disk and a URL host. Replaced with `re.sub(r"(?<![:/\w])hermes-agent(?!\.nousresearch\.com)", ...)`. The **lookbehind** is what protects filesystem paths and URL path segments; the lookahead only protects the docs host.
@@ -221,7 +244,8 @@ Filed together — same contract, same companion actuator, one PR narrative.
 - **Re-merge-risk:** LOW→NONE. Deliberately byte-identical to #48868's regex; if it merges, this patch disappears into it.
 - **Reconciler action:** **do not file a fourth PR.** ~~Comment on #48860~~ **DONE 2026-08-19** — [comment #5342697543](https://github.com/NousResearch/hermes-agent/issues/48860#issuecomment-5342697543) filed with the canary reproducer, the delegation amplification, the PR adjudication (#48865's `\b` does **not** fix the filesystem-path class; #48868's lookbehind does), two suggested regression tests including the anti-neutering one, and the generalization to *transport-layer mutation of agent-authored text* cross-linking #84222.
 
-#### PATCH-011: `SessionDB._execute_write` None-guard on closed connection (`hermes_state.py`)
+#### `sessiondb-write-none-guard`: `SessionDB._execute_write` None-guard on closed connection (`hermes_state.py`)
+- **Legacy-ID:** `PATCH-011` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** ON `local`. Replayed clean at the 2026-07-04 resync (auto-merged, only the PATCHES.md registry itself conflicted). **Live after each gateway/cron-worker restart** (editable install — `hermes_state.py` is imported straight from this repo checkout via `__editable__.hermes_agent-0.18.0.pth` since the 2026-07-04 cutover venv sync; confirmed no separate installed copy shadows it).
 - **Files:** `hermes_state.py` (`SessionDB._execute_write`, ~4 lines added before the existing `BEGIN IMMEDIATE` call).
 - **What:** `_execute_write` unconditionally called `self._conn.execute("BEGIN IMMEDIATE")` with no guard against `self._conn` having been set to `None` by a concurrent `close()` on the same `SessionDB` instance. Adds an explicit `if self._conn is None: raise RuntimeError(...)` immediately before that call, converting the opaque `AttributeError: 'NoneType' object has no attribute 'execute'` into a typed, self-describing `RuntimeError` that existing broad `except Exception` callers already catch and log.
@@ -240,14 +264,16 @@ Site-specific by construction. No generic upstream audience exists for these; th
 candidates for filing and are not expected to ever leave this registry except by direct
 supersession.
 
-#### PATCH-002: Untracked test file / skill dir
+#### `untracked-test-and-skill-residue`: Untracked test file / skill dir
+- **Legacy-ID:** `PATCH-002` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Why local:** working-tree residue (a plugin test file and a devops skill directory) that never got committed or relocated — pure git-hygiene risk, not a feature.
 - **Status:** PARTIALLY RESOLVED — `test_memory_tool_eviction.py` committed with PATCH-001 (2026-06-10). Still untracked: `tests/plugins/test_skill_relevance_gate.py`, `skills/devops/kanban-closed-loop-supervisor/`.
 - **Provenance:** Not recoverable from git by definition (never committed). First documented in the external pre-resync registry, created 2026-06-03, already listed as pre-existing untracked items at that point. `~/.hermes/plugins/hermes-achievements/` state files date to 2026-05-30, giving a rough lower bound for how long untracked material had already accumulated before anyone inventoried it. Standing item, unresolved across at least three audit passes (2026-06-03, 2026-07-04 resync, this 2026-07-05 pass).
 - **Risk:** LOW — at risk from `git reset --hard`/`clean -x`, not from rebase churn (nothing to conflict).
 - **Path to safety:** commit on `local`, or relocate to `~/.hermes/plugins/skill_relevance_gate/tests/`.
 
-#### PATCH-004: Myrgic overlay header in `AGENTS.md`
+#### `myrgic-overlay-header`: Myrgic overlay header in `AGENTS.md`
+- **Legacy-ID:** `PATCH-004` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Why local:** a fork-identity banner naming Myrgic/the local branch model has no upstream target by definition — this is infrastructure for *this checkout*, not a feature upstream could adopt.
 - **Status:** ON `local` (this commit), unchanged since creation.
 - **Files:** `AGENTS.md` (prepended block, delimited by `MYRGIC-LOCAL-OVERLAY:START/END`)
@@ -255,44 +281,52 @@ supersession.
 - **Provenance:** Born 2026-06-03 10:06:32 EDT (`efe0cffd3`) — the same commit that created this in-repo registry itself. No prior incident; infrastructure-first work.
 - **Risk:** LOW — additive, prepended above upstream content; rebase conflicts only if upstream rewrites the first lines of `AGENTS.md` (re-apply the delimited block). Kept-clean through both the 2026-06-10 and 2026-07-04 rebases with zero conflicts.
 
-#### EXT-001-Gate1-note: `oauth_billing_gate` plugin, Gate 1 half
+#### `oauth-billing-gate-gate1-note`: `oauth_billing_gate` plugin, Gate 1 half
+- **Legacy-ID:** `EXT-001` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Why local:** the plugin's Gate 1 tool-prefix forcing is now upstream-redundant-but-harmless — see the full EXT-001 entry below for the shared plugin, and ABSORBED-BY-UPSTREAM for the Gate 1 commits it duplicates. Documented separately here because Gate 1 and Gate 2 have different tracks (Gate 1 = local-permanent-but-simplifiable, Gate 2 = deliberate-divergence, tracked under PATCH-013's shared logic).
 - **Status:** Gate 1 (`_MCP_TOOL_PREFIX` forcing + unconditional tool-name re-walking) still runs on top of an upstream body that already does the identical fix correctly natively. No functional break. **TODO(simplification, not yet done):** drop the redundant Gate 1 forcing now that upstream ships `3d3786929`+`b70a4e753` natively — flagged in RESYNC-LEDGER.md, still open.
 - **Path to safety:** N/A — this is a "can be simplified away," not a "needs filing." See EXT-001's main entry for the plugin as a whole.
 
-#### EXT-002: `mod3_session` plugin
+#### `mod3-session-plugin`: `mod3_session` plugin
+- **Legacy-ID:** `EXT-002` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Why local:** wires Hermes into the Mod³ TTS/voice-dashboard system's session/seat lifecycle, SSE subscriber, and kernel-first session authority — Mod³ is Myrgic-local infrastructure with no upstream analog.
 - **Provenance:** Predates the 2026-06-03 registry — already listed, fully formed, "upstream-safe: YES," no creation date recorded. No incident or task record surfaced; reads as planned Mod³ infrastructure build-out.
 - **Path to safety:** N/A — user-space plugin, survives any reset by construction.
 
-#### EXT-003: `mod3_voice` plugin
+#### `mod3-voice-plugin`: `mod3_voice` plugin
+- **Legacy-ID:** `EXT-003` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Why local:** Discord voice-channel pipeline (SSE, WebSocket audio, VAD barge-in, `voice_output` tool) via Mod³ — same Mod³ dependency as EXT-002, no upstream analog.
 - **Provenance:** Predates the 2026-06-03 registry. Extensive design-journal material exists in `~/.hermes/journals/mod3-discord-voice-dreamer.md` (active through at least 2026-06-01) suggesting iterative design rather than incident-triggered work, but that's a design log, not a birth record.
 - **Path to safety:** N/A — user-space plugin.
 
-#### EXT-004: `bw_bridge` plugin
+#### `bw-bridge-plugin`: `bw_bridge` plugin
+- **Legacy-ID:** `EXT-004` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Why local:** Vaultwarden secret bridge (bootstrap/deposit/resolve + `secret:` URI projection) — implementation is tied to the operator's specific secret-manager choice; no generic secret-backend interface exists in this repo to compare against. The underlying *pattern* (secret-manager bridge) could inform a future generalized interface, but the implementation itself is not portable as-is.
 - **Provenance:** Predates the 2026-06-03 registry. No incident record; reads as planned secrets-management infrastructure.
 - **Live touch:** the 2026-07-04 triage session's Vaultwarden cert-trust cascade (Addendum 2) modified a companion file (`bw_bridge/secret_resolver.py`'s `unlock_session()`, both `bw unlock` calls switched to `_bw_env()`) — a live fix to the implementation, not a re-founding; core purpose unchanged.
 - **Path to safety:** N/A — user-space plugin.
 
-#### EXT-007: `auto-voice-reply` hook
+#### `auto-voice-reply-hook`: `auto-voice-reply` hook
+- **Legacy-ID:** `EXT-007` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Why local:** triggers automatic voice replies, depends on the Mod³ voice stack (EXT-002/003) — same site-specificity class.
 - **Provenance:** Predates the 2026-06-03 registry. No incident record recovered.
 - **Path to safety:** N/A — user-space hook.
 
-#### EXT-008: `bw-eclipse-key` hook
+#### `bw-eclipse-key-hook`: `bw-eclipse-key` hook
+- **Legacy-ID:** `EXT-008` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Why local:** injects the Eclipse (home-desktop LM Studio node) API key from Vaultwarden at gateway startup for the `cog` profile — names a specific machine, secret store, and profile by construction.
 - **Provenance:** Predates the 2026-06-03 registry.
 - **Live touch:** the 2026-07-04 triage session's Vaultwarden cert-trust cascade (Addendum 2) found and fixed a masked-layer bug the same day — `PROVIDER_KEYS` in `handler.py:42` still targeted old key names `cogos-eclipse`/`eclipse`, but the live config key had drifted to `eclipse-lms`. Fixed, backup kept. Result: "first successful completion of this hook ever" per FIXES-LEDGER.md Addendum 2 — this hook had likely never actually worked correctly end-to-end before 2026-07-04, despite existing since before the registry.
 - **Path to safety:** N/A — user-space hook.
 
-#### EXT-009: `mod3-voice-bootstrap` hook
+#### `mod3-voice-bootstrap-hook`: `mod3-voice-bootstrap` hook
+- **Legacy-ID:** `EXT-009` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Why local:** bootstraps the Mod³ voice pipeline at gateway startup — same Mod³ dependency family as EXT-002/003/007.
 - **Provenance:** Predates the 2026-06-03 registry. No incident record recovered.
 - **Path to safety:** N/A — user-space hook.
 
-#### EXT-010: `claude-token-refresh` actuator
+#### `claude-token-refresh-actuator`: `claude-token-refresh` actuator
+- **Legacy-ID:** `EXT-010` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Why local:** macOS Keychain + local Claude Code CLI binary path, outside the repo by construction. The underlying "delegate refresh to the actual token owner via a headless CLI call" *pattern* is worth folding into PATCH-007/008's eventual PR narrative as a reference implementation, not shipping the script itself.
 - **What:** Single-flight headless `claude -p` actuator that refreshes the CC-owned Keychain OAuth token on demand: fast-path (fresh token already) exits in under 1s, forced-stale path runs `claude -p` and exits in roughly 9s.
 - **Provenance:** Created alongside PATCH-007, 2026-06-03. Same incident as PATCH-007 — once Hermes was made strictly read-only against the CC-owned Keychain token, something still needed to trigger a refresh when even the keychain copy went stale.
@@ -307,7 +341,8 @@ this repo's maintainer (operator) chose not to adopt, or has no equivalent by de
 repo knowingly diverges. Distinct from LOCAL-PERMANENT: these *could* in principle track upstream
 but a deliberate decision keeps them off that path (for now).
 
-#### PATCH-001: Progressive memory eviction (`tools/memory_tool.py`)
+#### `progressive-memory-eviction`: Progressive memory eviction (`tools/memory_tool.py`)
+- **Legacy-ID:** `PATCH-001` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Status:** LIVE on `local` (landed 2026-06-10, `e0388eee5`, "feat(memory): silent Tier 1→Tier 3 eviction at 75% capacity (MEMDUMP-001)"). Reimplemented against the eviction test suite; the original draft in `stash@{0}` is redundant — verify and drop.
 - **Files:** `tools/memory_tool.py` (+175), `tests/tools/test_memory_tool.py` (legacy limit test repointed at the preserved hard-error path), `tests/tools/test_memory_tool_eviction.py` (now tracked).
 - **What:** Silent Tier 1→Tier 3 eviction at >75% capacity; evicted entries → CogOS cogdocs (substrate overflow dir, fallback `~/.hermes/memories/hermes-overflow`); Tier 2 pointer index; `scan_tier2_index_for_hot_entries()` read-side helper. An entry larger than the whole limit still stays a hard error.
@@ -318,12 +353,14 @@ but a deliberate decision keeps them off that path (for now).
 - **Re-merge-risk:** carried forward clean (auto-merge) through both the 2026-06-10 and 2026-07-04 (3,093-commit) rebases.
 - **Reconciler action:** none pending — deliberately not filed. Revisit only if the CogOS-cogdoc overflow target is ever generalized into something a stock install could use, which would change the shareability calculus entirely.
 
-#### PATCH-001 test-deltas (xfails) — `tests/tools/test_memory_tool.py`
+#### `progressive-memory-eviction-test-deltas` (xfails) — `tests/tools/test_memory_tool.py`
+- **Legacy-ID:** `PATCH-001` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Provenance:** 2026-07-04 12:06:48 EDT (`55b89aebc`), during the resync fix-forward pass, same pass as the PATCH-008 keychain xfail and the PATCH-010 mock-shape fix.
 - **Why xfail, not deleted:** the gate is mechanical (any regressing test = RED, no cutover). Rather than silently deleting or skipping the now-invalid assertions, they were marked `xfail` with the reason cited by name (PATCH-001) — document the contract change, don't erase the historical test.
 - **Status:** standing, no action needed — this is documented local test debt tracking PATCH-001's divergence, not a functional defect.
 
-#### EXT-001-Gate2 (shared logic with PATCH-013): `oauth_billing_gate` plugin, Gate 2 half
+#### `oauth-billing-gate-gate2` (shared logic with `oauth-gate2-identity-relocation`): `oauth_billing_gate` plugin, Gate 2 half
+- **Legacy-ID:** `EXT-001` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Why deliberate-divergence:** independent plugin-level copy of PATCH-013's Gate 2 relocation logic — a belt-and-suspenders layer built specifically because the underlying fix had already been lost twice to branch/reset operations predating any source-level patch. A plugin outside the tracked repo survives any `git reset`/`checkout upstream/main` that would clobber an in-repo commit. See PATCH-013 (NEEDS-WORK-TO-FILE above) for the full upstream landscape this logic shares.
 - **Provenance:** RCA dated 2026-05-29 (`cog://mem/semantic/research/2026-05-29-anthropic-oauth-dual-gate-definitive`); plugin created on or before 2026-06-03. A same-day-of-creation fix cycle recorded 2026-06-05: ~17:08 an edit changed built-ins to `bare→bare` (to fix the `mcp__patch` round-trip) which reopened Gate 2's tool-array face → 400 storm from 17:23; fixed same day (restored `bare→mcp__` AND added the deterministic inbound reversal).
 - **Status:** this stays as the plugin's whole reason to exist until PATCH-013 lands upstream and is confirmed to survive a reset.
@@ -336,7 +373,8 @@ but a deliberate decision keeps them off that path (for now).
 Historical. Patches whose upstream equivalent landed independently and content-verified identical
 — the patch dropped out at rebase (commit went empty). Kept here as a record, not an action item.
 
-#### PATCH-003 → `abc3662bf`: launchd `/restart` detection (`gateway/slash_commands.py`)
+#### `launchd-restart-detection` → `abc3662bf`: launchd `/restart` detection (`gateway/slash_commands.py`)
+- **Legacy-ID:** `PATCH-003` (pre-slug registry number; cited by earlier commits and upstream refs)
 - **Dropped commits:** `9d8b673d7`, `ee023c33c`, `10e01c310`, `b3b1f2401` (4 commits, 2026-07-04 resync).
 - **Upstream equivalent:** `abc3662bf` — "fix(gateway): detect launchd in /restart service-manager probe (#43475)".
 - **Verification:** content-compared, not just an empty cherry-pick diff — same `XPC_SERVICE_NAME not in ("", "0")` guard, same exclusion-of-literal-`"0"` reasoning, explicitly "Fixes #43475" (the same issue local PR #43888 targeted). The pin test (`tests/gateway/test_restart_service_detection.py`) also came up empty because upstream ships the identical 4 test cases verbatim.
