@@ -1914,3 +1914,77 @@ class TestFinalPayloadHasNoBlankTextBlocks:
         )
         image_blocks = [b for b in tool_result_block["content"] if b.get("type") == "image"]
         assert len(image_blocks) == 1
+class TestOAuthSanitizerSlugPreservation:
+    """Regression tests for NousResearch/hermes-agent#48860 (local PATCH-017).
+
+    The OAuth system-prompt sanitizer must not rewrite the ``hermes-agent``
+    slug when it appears inside a URL host, a URL path, or a *local
+    filesystem path*. The filesystem-path case is the one upstream #48860
+    never named: it is how corrupted interpreter paths reached delegated
+    subagents (they were handed ``.hermes/claude-code/venv/bin/python``,
+    a path the parent never wrote).
+
+    These run the real production path ``build_anthropic_kwargs(
+    is_oauth=True)`` rather than reimplementing the sanitizer, so a
+    regression in the live code cannot pass here. NOTE: this fork relocates
+    the agent identity out of ``system`` into the first user turn (Gate 2),
+    so these assert over the whole assembled payload.
+    """
+
+    def _oauth_payload_text(self, prompt: str) -> str:
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-20250514",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": "Hi"},
+            ],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            is_oauth=True,
+        )
+        return json.dumps(
+            {"system": kwargs.get("system"), "messages": kwargs.get("messages")}
+        )
+
+    def test_local_filesystem_path_is_preserved(self):
+        """The defect that corrupted delegation briefs."""
+        text = self._oauth_payload_text(
+            "Use /Users/slowbro/.hermes/hermes-agent/venv/bin/python"
+        )
+        assert "/.hermes/hermes-agent/venv/bin/python" in text
+        assert "claude-code/venv" not in text
+
+    def test_docs_url_host_is_preserved(self):
+        """The symptom upstream #48860 originally reported."""
+        text = self._oauth_payload_text(
+            "See https://hermes-agent.nousresearch.com/docs for details."
+        )
+        assert "hermes-agent.nousresearch.com" in text
+        assert "claude-code.nousresearch.com" not in text
+
+    def test_url_path_segment_is_preserved(self):
+        """#48868's lookbehind (not #48865's \\b) is what covers this."""
+        text = self._oauth_payload_text(
+            "Repo: https://github.com/NousResearch/hermes-agent"
+        )
+        assert "NousResearch/hermes-agent" in text
+
+    def test_bare_product_slug_is_still_replaced(self):
+        """The sanitizer must not be neutered — bare slug still swaps."""
+        text = self._oauth_payload_text("Running under hermes-agent right now.")
+        assert "under claude-code right now" in text
+
+    def test_product_names_still_replaced(self):
+        text = self._oauth_payload_text("Hermes Agent, built by Nous Research.")
+        assert "Claude Code" in text
+        assert "Anthropic" in text
+        assert "Nous Research" not in text
+
+    def test_path_and_bare_slug_in_same_prompt(self):
+        """Combined case: one occurrence must survive, the other must swap."""
+        text = self._oauth_payload_text(
+            "hermes-agent lives at /Users/x/.hermes/hermes-agent/venv"
+        )
+        assert "/.hermes/hermes-agent/venv" in text
+        assert "claude-code lives at" in text

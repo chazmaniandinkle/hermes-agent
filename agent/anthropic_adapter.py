@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import stat
 import subprocess
@@ -2963,11 +2964,30 @@ def build_anthropic_kwargs(
 
         # 2. Sanitize — replace product-name references that the OAuth
         #    content filters key on.
+        #
+        #    The ``hermes-agent`` slug is NOT a plain str.replace: it is an
+        #    identifier that also appears inside URLs *and inside local
+        #    filesystem paths* (e.g. ~/.hermes/hermes-agent/venv/bin/python).
+        #    A blanket replace silently rewrites those into paths/hosts that
+        #    do not exist, and the corruption is invisible to the author —
+        #    it happens on the wire, after the text leaves the agent.
+        #    Observed in the wild: delegation briefs handed subagents
+        #    ``/Users/<u>/.hermes/claude-code/venv/bin/python``; three
+        #    independent workers reported a path the parent never wrote.
+        #    Upstream: NousResearch/hermes-agent#48860 (docs-host symptom),
+        #    PRs #48865 / #48868 / #58659 open since 2026-06-19. This adopts
+        #    #48868's regex verbatim so the eventual merge rebases to a
+        #    no-op. The lookbehind ``(?<![:/\w])`` is what protects the
+        #    filesystem-path case; the lookahead only protects the docs host.
         for _a, _b in (("Hermes Agent", "Claude Code"),
                        ("Hermes agent", "Claude Code"),
-                       ("hermes-agent", "claude-code"),
                        ("Nous Research", "Anthropic")):
             identity_text = identity_text.replace(_a, _b)
+        identity_text = re.sub(
+            r"(?<![:/\w])hermes-agent(?!\.nousresearch\.com)",
+            "claude-code",
+            identity_text,
+        )
 
         # 3. System field carries ONLY the canonical Claude Code identity
         #    (Gate 2 — local patch, no upstream equivalent); the agent
