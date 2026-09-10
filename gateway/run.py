@@ -2013,6 +2013,77 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_cfg["search_slow_ms"])
 
 
+def _bridge_plugin_auxiliary_env(home: "Path") -> None:
+    """Bridge config.yaml's ``auxiliary.*`` block into AUXILIARY_<KEY>_* env vars.
+
+    Covers the built-in tasks (vision, web_extract, approval) plus any
+    plugin-registered auxiliary task returned by ``get_plugin_auxiliary_tasks()``.
+
+    MUST NOT be called from gateway/run.py module scope — see the comment at
+    the auxiliary-bridging call site (former location, now just a pointer
+    comment, near the top of this module) for why: it calls
+    get_plugin_auxiliary_tasks() -> PluginManager.discover_and_load(), which
+    can block on PluginManager._discovery_lock while a background discovery
+    thread concurrently blocks importing this same module (gateway.run) from
+    a plugin's register() — an import-lock/discovery-lock deadlock. Call this
+    only after `import gateway.run` has completed, e.g. from
+    GatewayRunner.start() before the first agent turn.
+    """
+    config_path = home / 'config.yaml'
+    if not config_path.exists():
+        return
+    try:
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+        # Presence-sensitive env bridge: raw read is deliberate (only keys the
+        # user actually wrote get bridged); overlay + expansion applied below.
+        cfg = read_user_config_raw(config_path)
+        cfg = _expand_env_vars(cfg)
+        if not isinstance(cfg, dict):
+            cfg = {}
+        try:
+            from hermes_cli import managed_scope
+            cfg = managed_scope.apply_managed_overlay(cfg)
+        except Exception:
+            pass
+    except Exception:
+        return
+
+    _auxiliary_cfg = cfg.get("auxiliary", {})
+    if not (_auxiliary_cfg and isinstance(_auxiliary_cfg, dict)):
+        return
+
+    # Built-in tasks that previously had explicit env-var bridging. Kept here
+    # as the canonical bridged set; plugin tasks are added via the plugin
+    # auxiliary registry below.
+    _aux_bridged_keys = {"vision", "web_extract", "approval"}
+    try:
+        from hermes_cli.plugins import get_plugin_auxiliary_tasks
+        for _entry in get_plugin_auxiliary_tasks():
+            _aux_bridged_keys.add(_entry["key"])
+    except Exception:
+        # Plugin discovery failure must not break gateway startup; built-in
+        # bridging stays intact.
+        pass
+
+    for _task_key in _aux_bridged_keys:
+        _task_cfg = _auxiliary_cfg.get(_task_key, {})
+        if not isinstance(_task_cfg, dict):
+            continue
+        _prov = str(_task_cfg.get("provider", "")).strip()
+        _model = str(_task_cfg.get("model", "")).strip()
+        _base_url = str(_task_cfg.get("base_url", "")).strip()
+        _api_key = str(_task_cfg.get("api_key", "")).strip()
+        _upper = _task_key.upper()
+        if _prov and _prov != "auto":
+            os.environ[f"AUXILIARY_{_upper}_PROVIDER"] = _prov
+        if _model:
+            os.environ[f"AUXILIARY_{_upper}_MODEL"] = _model
+        if _base_url:
+            os.environ[f"AUXILIARY_{_upper}_BASE_URL"] = _base_url
+        if _api_key:
+            os.environ[f"AUXILIARY_{_upper}_API_KEY"] = _api_key
+
+
 def _current_max_iterations() -> int:
     """Return the current per-turn iteration budget after runtime env refresh."""
     _reload_runtime_env_preserving_config_authority()
@@ -2261,44 +2332,27 @@ if _config_path.exists():
         # Compression config is read directly from config.yaml by run_agent.py
         # and auxiliary_client.py — no env var bridging needed.
         # Auxiliary model/direct-endpoint overrides (vision, web_extract,
-        # approval, plus any plugin-registered auxiliary tasks).
-        # Each task has provider/model/base_url/api_key; bridge non-default
-        # values to env vars named AUXILIARY_<KEY_UPPER>_*. The legacy
-        # hard-coded list (vision/web_extract/approval) is replaced by a
-        # dynamic loop so plugin-registered tasks benefit from the same
-        # config→env bridging without core knowing about each one.
-        _auxiliary_cfg = _cfg.get("auxiliary", {})
-        if _auxiliary_cfg and isinstance(_auxiliary_cfg, dict):
-            # Built-in tasks that previously had explicit env-var bridging.
-            # Kept here as the canonical bridged set; plugin tasks are added
-            # below via the plugin auxiliary registry.
-            _aux_bridged_keys = {"vision", "web_extract", "approval"}
-            try:
-                from hermes_cli.plugins import get_plugin_auxiliary_tasks
-                for _entry in get_plugin_auxiliary_tasks():
-                    _aux_bridged_keys.add(_entry["key"])
-            except Exception:
-                # Plugin discovery failure must not break gateway startup;
-                # built-in bridging stays intact.
-                pass
-
-            for _task_key in _aux_bridged_keys:
-                _task_cfg = _auxiliary_cfg.get(_task_key, {})
-                if not isinstance(_task_cfg, dict):
-                    continue
-                _prov = str(_task_cfg.get("provider", "")).strip()
-                _model = str(_task_cfg.get("model", "")).strip()
-                _base_url = str(_task_cfg.get("base_url", "")).strip()
-                _api_key = str(_task_cfg.get("api_key", "")).strip()
-                _upper = _task_key.upper()
-                if _prov and _prov != "auto":
-                    os.environ[f"AUXILIARY_{_upper}_PROVIDER"] = _prov
-                if _model:
-                    os.environ[f"AUXILIARY_{_upper}_MODEL"] = _model
-                if _base_url:
-                    os.environ[f"AUXILIARY_{_upper}_BASE_URL"] = _base_url
-                if _api_key:
-                    os.environ[f"AUXILIARY_{_upper}_API_KEY"] = _api_key
+        # approval, plus any plugin-registered auxiliary tasks) used to be
+        # bridged right here. Moved to _bridge_plugin_auxiliary_env() (below,
+        # module scope but NOT called here) and invoked instead from
+        # GatewayRunner.start(), before the first agent turn.
+        #
+        # WHY: this block calls get_plugin_auxiliary_tasks(), which triggers
+        # PluginManager.discover_and_load() — a blocking acquire of
+        # PluginManager._discovery_lock plus arbitrary plugin-code imports.
+        # Running that from gateway/run.py's *module body* means the caller
+        # still holds CPython's per-module import lock for `gateway.run`
+        # (we are mid `import gateway.run`). If the plugin-discovery
+        # background thread (start_background_plugin_discovery) is
+        # concurrently loading a plugin whose register() does
+        # `from gateway.run import ...` (e.g. the darkstar profile's
+        # skill_relevance_gate), that thread blocks on the gateway.run
+        # import lock while holding _discovery_lock — a two-lock cycle with
+        # opposite acquisition order, so neither side can proceed and
+        # nothing times out. Confirmed by faulthandler dump, 2026-09-10
+        # (darkstar profile, 8 consecutive reproductions). Deferring this
+        # call to after `import gateway.run` has completed (module lock
+        # already released) breaks the cycle.
         # config.yaml is the documented, authoritative source for these
         # settings — it unconditionally wins over .env values. Previously
         # the guards below read `if X not in os.environ` and let stale
@@ -12153,6 +12207,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        # Bridge config.yaml's auxiliary.* block (vision/web_extract/approval
+        # + any plugin-registered auxiliary task) into AUXILIARY_<KEY>_* env
+        # vars. Deliberately done here — after `import gateway.run` has
+        # completed — and not at module scope: see
+        # _bridge_plugin_auxiliary_env()'s docstring for the import-lock /
+        # plugin-discovery-lock deadlock this call site avoids.
+        try:
+            _bridge_plugin_auxiliary_env(_hermes_home)
+        except Exception:
+            logger.debug("plugin auxiliary env bridging failed", exc_info=True)
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
         # pythonw / detached service) — otherwise the gateway would die
