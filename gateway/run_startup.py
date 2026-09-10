@@ -1474,6 +1474,14 @@ class GatewayStartupMixin:
 
     async def _start_impl(self) -> bool:
         logger.info("Starting Hermes Gateway...")
+        # fix-gateway-run-import-lock-plugin-discovery (local): bridge plugin-registered auxiliary.*
+        # keys now — after `import gateway.run` completed and released its import lock — never at
+        # module scope, where plugin discovery could deadlock against the background discovery thread.
+        try:
+            from gateway.run import _bridge_plugin_auxiliary_env, _hermes_home as _gw_home
+            _bridge_plugin_auxiliary_env(_gw_home)
+        except Exception:
+            logger.debug("plugin auxiliary env bridging failed", exc_info=True)
         self._start_install_faulthandler()
         await self._start_log_startup_environment()
         if await self._abort_startup_if_shutdown_requested():

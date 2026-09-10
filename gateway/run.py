@@ -2029,15 +2029,24 @@ def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
         os.environ[_env_var] = json.dumps(_val) if isinstance(_val, (list, dict)) else str(_val)
 
 
-def _bridge_auxiliary_config_to_env(_auxiliary_cfg: dict) -> None:
-    """Bridge auxiliary model/endpoint overrides (vision, approval, plugins); compression reads yaml."""
+def _bridge_auxiliary_config_to_env(_auxiliary_cfg: dict, *, include_plugins: bool = True) -> None:
+    """Bridge auxiliary model/endpoint overrides (vision, approval, plugins); compression reads yaml.
+
+    fix-gateway-run-import-lock-plugin-discovery (local): ``include_plugins=False`` skips
+    ``get_plugin_auxiliary_tasks()`` — plugin discovery — so the MODULE-SCOPE bridge that runs while
+    ``import gateway.run`` holds the per-module import lock cannot deadlock against the background
+    plugin-discovery thread (which holds ``PluginManager._discovery_lock`` and may itself
+    ``from gateway.run import ...`` in a plugin's register()). Plugin-registered keys are bridged by
+    ``_bridge_plugin_auxiliary_env()`` from ``GatewayRunner.start()`` once the import has completed.
+    """
     _aux_bridged_keys = {"vision", "approval"}
-    try:
-        from hermes_cli.plugins import get_plugin_auxiliary_tasks
-        for _entry in get_plugin_auxiliary_tasks():
-            _aux_bridged_keys.add(_entry["key"])
-    except Exception:
-        pass  # plugin discovery failure must not break startup; built-in bridging stays intact
+    if include_plugins:
+        try:
+            from hermes_cli.plugins import get_plugin_auxiliary_tasks
+            for _entry in get_plugin_auxiliary_tasks():
+                _aux_bridged_keys.add(_entry["key"])
+        except Exception:
+            pass  # plugin discovery failure must not break startup; built-in bridging stays intact
     for _task_key in _aux_bridged_keys:
         _task_cfg = _auxiliary_cfg.get(_task_key, {})
         if not isinstance(_task_cfg, dict):
@@ -2052,7 +2061,19 @@ def _bridge_auxiliary_config_to_env(_auxiliary_cfg: dict) -> None:
                 os.environ[f"AUXILIARY_{_upper}_{_suffix}"] = _value
 
 
-def _bridge_config_to_env(_cfg: dict) -> None:
+def _bridge_plugin_auxiliary_env(home: "Path") -> None:
+    """fix-gateway-run-import-lock-plugin-discovery (local): the plugin-aware half of the auxiliary
+    bridge, deferred from import time to ``GatewayRunner.start()`` (see
+    ``_bridge_auxiliary_config_to_env``). Built-in keys are re-bridged idempotently."""
+    config_path = home / "config.yaml"
+    if not config_path.exists():
+        return
+    _auxiliary_cfg = _load_bridge_config(config_path).get("auxiliary", {})
+    if _auxiliary_cfg and isinstance(_auxiliary_cfg, dict):
+        _bridge_auxiliary_config_to_env(_auxiliary_cfg, include_plugins=True)
+
+
+def _bridge_config_to_env(_cfg: dict, *, include_plugin_auxiliary: bool = True) -> None:
     """Export config.yaml settings to the env vars os.getenv() consumers read."""
     for _key, _val in _cfg.items():  # top-level scalars: fallback only, never override .env
         if isinstance(_val, (str, int, float, bool)) and _key not in os.environ:
@@ -2062,7 +2083,7 @@ def _bridge_config_to_env(_cfg: dict) -> None:
         _bridge_terminal_config_to_env(_terminal_cfg)
     _auxiliary_cfg = _cfg.get("auxiliary", {})
     if _auxiliary_cfg and isinstance(_auxiliary_cfg, dict):
-        _bridge_auxiliary_config_to_env(_auxiliary_cfg)
+        _bridge_auxiliary_config_to_env(_auxiliary_cfg, include_plugins=include_plugin_auxiliary)
     # config.yaml is the documented, authoritative source for these settings — it unconditionally wins over
     # .env values. Previously the guards below read `if X not in os.environ` and let stale .env entries
     # (e.g. HERMES_MAX_ITERATIONS=60 written by an old `hermes setup` run) silently shadow the user's
@@ -2109,7 +2130,9 @@ _cfg: dict = {}
 if _config_path.exists():
     try:
         _cfg = _load_bridge_config(_config_path)
-        _bridge_config_to_env(_cfg)
+        # Module scope: NO plugin discovery here (import-lock deadlock, see
+        # fix-gateway-run-import-lock-plugin-discovery); plugin keys bridge at GatewayRunner.start().
+        _bridge_config_to_env(_cfg, include_plugin_auxiliary=False)
     except Exception as _bridge_err:
         # stderr, not logger: the module logger is not initialized yet at import time.
         print(

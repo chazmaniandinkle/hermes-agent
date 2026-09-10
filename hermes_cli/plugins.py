@@ -1990,10 +1990,13 @@ def get_plugin_error_classification(
 
 
 def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
-    """Return the global manager after idempotent (or ``force``d) discovery."""
-    manager = get_plugin_manager()
-    manager.discover_and_load(force=force)
-    return manager
+    """Return the global manager after idempotent (or ``force``d) discovery.
+
+    fix-gateway-run-import-lock-plugin-discovery (local): routed through ``discover_plugins()`` so a
+    synchronous consumer JOINS an in-flight background discovery instead of racing it (the invariant
+    documented on ``start_background_plugin_discovery``)."""
+    discover_plugins(force=force)
+    return get_plugin_manager()
 
 
 def get_plugin_context_engine():
