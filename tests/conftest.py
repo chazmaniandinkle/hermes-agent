@@ -1062,10 +1062,39 @@ def _wal_is_usable() -> bool:
 #    gateway call sites late-import, so patching the module attribute catches
 #    them wherever they import it from.
 #  • ``hermes_cli.voice.play_audio_file`` — the module-level binding
-#    ``speak_text`` actually plays through. Patching the binding inside
-#    ``hermes_cli.voice`` (not ``tools.voice_mode``) keeps the real function
-#    available to the tests that legitimately exercise it with a mocked
-#    audio backend (``tests/tools/test_voice_mode.py``).
+#    ``speak_text`` actually plays through.
+#  • ``tools.voice_mode.{play_audio_file,play_beep,_play_int16_via_tempfile}``
+#    — the *origin* definitions. See below.
+#
+# 2026-09-10 follow-up: the guard above was not sufficient, and the same class
+# of incident recurred — a ``pytest tests/gateway/`` run spoke "Hello world"
+# out of the developer's speakers, twice.
+#
+# The original guard deliberately patched only the ``hermes_cli.voice``
+# re-export "to keep the real function available to the tests that legitimately
+# exercise it". That carve-out was the hole. The escaping route never touches
+# ``hermes_cli.voice`` at all:
+#
+#   tests/gateway/test_voice_command.py::TestStreamTtsToSpeaker
+#     -> tools.tts_tool.stream_tts_to_speaker   (called for real, unmocked)
+#     -> tools/tts_tool.py: ``from tools.voice_mode import play_audio_file``
+#     -> tools.voice_mode.play_audio_file -> subprocess.Popen(["afplay", ...])
+#
+# That late import resolves the attribute off ``tools.voice_mode`` at call
+# time, so patching the ``hermes_cli.voice`` binding does nothing to it. The
+# ``edge`` TTS provider is keyless, so synthesis succeeded with no credentials
+# and the fixture string went to the speakers.
+#
+# Fix: patch the *origin* definitions in ``tools.voice_mode`` as well, so
+# every re-export and late import resolves to the stub. Tests that genuinely
+# drive the real playback function (they stub ``subprocess.Popen`` or
+# ``sounddevice`` themselves, so they were never audible) opt back in with
+# ``@pytest.mark.real_audio_playback``.
+#
+# Note what is deliberately NOT stubbed: ``text_to_speech_tool``. Synthesis
+# without playback is silent, and stubbing it would break the ~10
+# ``tests/tools/test_tts_*.py`` files that assert on real synthesis plumbing.
+# Blocking the speaker-opening primitive is both necessary and sufficient.
 #
 # Config cannot re-open this hole: the ``tts:`` section of ``config.yaml``
 # only selects *which* provider speaks, never *whether* to speak — that gate
@@ -1677,10 +1706,35 @@ def _audio_playback_guard(request, monkeypatch):
     def _blocked_play_audio_file(path, *args, **kwargs):
         return False
 
+    def _blocked_play_beep(*args, **kwargs):
+        return None
+
+    def _blocked_play_int16_via_tempfile(*args, **kwargs):
+        return None
+
     if hasattr(_voice, "speak_text"):
         monkeypatch.setattr(_voice, "speak_text", _blocked_speak_text)
     if hasattr(_voice, "play_audio_file"):
         monkeypatch.setattr(_voice, "play_audio_file", _blocked_play_audio_file)
+
+    # Patch the ORIGIN definitions too. ``tools/tts_tool.py`` late-imports
+    # ``play_audio_file`` straight off ``tools.voice_mode`` inside the
+    # streaming-TTS drain loop, so the ``hermes_cli.voice`` binding above is
+    # not on that path at all. This is the hole the 2026-09-10 "Hello world"
+    # incident went through.
+    try:
+        import tools.voice_mode as _vm
+    except Exception:
+        yield
+        return
+
+    for _name, _stub in (
+        ("play_audio_file", _blocked_play_audio_file),
+        ("play_beep", _blocked_play_beep),
+        ("_play_int16_via_tempfile", _blocked_play_int16_via_tempfile),
+    ):
+        if hasattr(_vm, _name):
+            monkeypatch.setattr(_vm, _name, _stub)
 
     yield
 
