@@ -233,6 +233,82 @@ def _reset_hygiene_failure_streak(gateway, session_key: str) -> None:
             logger.debug("hygiene failure streak persistent reset failed: %s", exc)
 
 
+# Guard B — compaction-failure escalation (#context-blowup).
+#
+# Session hygiene tries to auto-compress an oversized transcript BEFORE the
+# turn runs. When that keeps aborting (summary model times out / returns no
+# output), the current behaviour is to warn and *continue without compression*
+# — so the turn then dispatches the full, over-limit context and the loop
+# re-sends it on every empty-response retry. That is safe for the FIRST couple
+# of aborts (transient provider blips) but must NOT repeat forever: if
+# compaction cannot reduce the context, the session must stop re-sending an
+# over-limit context.
+#
+# N = 3, chosen to mirror the existing failure-cooldown multiplier ladder
+# (_HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9), which caps its escalation
+# at a streak of 3) and the agent's max_compression_attempts (3). Two
+# consecutive failures can still be a transient blip; requiring three keeps
+# current behaviour for the first two real aborts and guarantees the session
+# stops burning full-context sends no later than the third. The count is the
+# existing persistent ``hygiene_failure_streak`` (rotation-stable per
+# session_key), which is already incremented on every abort and reset to 0 by
+# ``_reset_hygiene_failure_streak`` after a compaction that recovered context.
+_HYGIENE_ESCALATE_AFTER = 3
+
+
+class SessionHygieneCompactionExhausted(Exception):
+    """Raised after N consecutive compaction aborts to abort the turn.
+
+    Reuses the same dispatch-aborting pattern the hygiene TIMEOUT branch already
+    uses (``gateway/run.py`` raises out of ``_handle_message_with_agent`` on a
+    timeout so the oversized context is never re-dispatched). Raising here keeps
+    a wedged session from continuing into a fresh agent + full-context send once
+    compaction has provably failed N times in a row.
+    """
+
+
+def hygiene_abort_escalation_reached(
+    streak: int,
+    threshold: int = _HYGIENE_ESCALATE_AFTER,
+) -> bool:
+    """True once the consecutive-abort streak reaches ``threshold``.
+
+    First ``threshold - 1`` aborts keep current (warn-and-continue) behaviour;
+    at/after ``threshold`` the session must escalate loudly and stop re-sending.
+    ``threshold <= 0`` disables escalation (returns False) so operators can turn
+    it off.
+    """
+    if threshold <= 0:
+        return False
+    return streak >= threshold
+
+
+def _peek_hygiene_failure_streak(gateway, session_key: str) -> int:
+    """Read the current consecutive-abort streak, or 0 on any failure.
+
+    Returns 0 (never escalates) on error so a broken/missing state store cannot
+    wrongly wedge a session into refusing all turns.
+    """
+    try:
+        state = gateway._peek_session_state(session_key)
+        if state is None:
+            return 0
+        return int(getattr(state.persistent, "hygiene_failure_streak", 0) or 0)
+    except Exception:
+        return 0
+
+
+def hygiene_escalation_user_message(threshold: int = _HYGIENE_ESCALATE_AFTER) -> str:
+    """Distinct operator-facing message sent once escalation has triggered."""
+    return (
+        "⚠️ Context compression has failed "
+        f"{threshold} consecutive times and the session remains over the model "
+        "window. Auto-compaction can no longer reduce it, so this session is "
+        "refusing to re-send an over-limit context. Please /reset for a clean "
+        "session now, or fix your auxiliary.compression model configuration."
+    )
+
+
 def hygiene_compaction_recovered(
     *,
     aborted: bool,
@@ -19500,6 +19576,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 time.monotonic() - _hyg_wait_started,
                                                 _hyg_total_ceiling_seconds,
                                             )
+                                            # Guard B escalation: distinct
+                                            # signature once compaction has timed
+                                            # out with no progress N consecutive
+                                            # times (this branch already aborts
+                                            # the dispatch via the raise below;
+                                            # the signature makes the state-gov
+                                            # conformance probe and the incident
+                                            # triage greppable).
+                                            _escal_streak = _peek_hygiene_failure_streak(
+                                                self, session_key
+                                            )
+                                            if hygiene_abort_escalation_reached(_escal_streak):
+                                                logger.critical(
+                                                    "Session hygiene: compaction timed out "
+                                                    "with no progress %s consecutive times "
+                                                    "for session %s (escalation threshold "
+                                                    "%s) — refusing to re-dispatch an "
+                                                    "over-limit context; aborting turn",
+                                                    _escal_streak,
+                                                    session_entry.session_id,
+                                                    _HYGIENE_ESCALATE_AFTER,
+                                                )
                                             _timeout_msg = (
                                                 "⚠️ Context compression timed out "
                                                 f"after {_hyg_timeout_seconds:.1f}s "
@@ -19760,6 +19858,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 "Failed to deliver compression-failure warning to user: %s",
                                                 _werr,
                                             )
+                                    # Guard B escalation: once compaction has
+                                    # aborted N consecutive times, do NOT fall
+                                    # through to dispatch the over-limit context
+                                    # again. Emit a DISTINCT signature and abort
+                                    # the turn (same dispatch-aborting pattern as
+                                    # the hygiene TIMEOUT branch's raise above).
+                                    _escal_streak = _peek_hygiene_failure_streak(
+                                        self, session_key
+                                    )
+                                    if hygiene_abort_escalation_reached(_escal_streak):
+                                        logger.critical(
+                                            "Session hygiene: compaction aborted "
+                                            "%s consecutive times for session %s "
+                                            "(escalation threshold %s) — refusing "
+                                            "to re-dispatch an over-limit context; "
+                                            "aborting turn",
+                                            _escal_streak,
+                                            session_entry.session_id,
+                                            _HYGIENE_ESCALATE_AFTER,
+                                        )
+                                        try:
+                                            _escal_adapter = self._adapter_for_source(source)
+                                            if _escal_adapter and source.chat_id:
+                                                await _escal_adapter.send(
+                                                    source.chat_id,
+                                                    hygiene_escalation_user_message(
+                                                        _HYGIENE_ESCALATE_AFTER
+                                                    ),
+                                                    metadata=_hyg_meta,
+                                                )
+                                        except Exception as _werr:
+                                            logger.warning(
+                                                "Failed to deliver hygiene "
+                                                "escalation warning to user: %s",
+                                                _werr,
+                                            )
+                                        raise SessionHygieneCompactionExhausted(
+                                            f"session {session_entry.session_id} "
+                                            f"compaction aborted {_escal_streak} "
+                                            "consecutive times"
+                                        )
                                     # Separately: if the user's CONFIGURED aux
                                     # model failed and we recovered by falling
                                     # back to the main model, tell them — a

@@ -469,6 +469,58 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
     )
 
 
+def _should_refuse_over_limit_dispatch(
+    compressor: Any,
+    request_pressure_tokens: int,
+    defer_preflight,
+) -> Optional[int]:
+    """Decide whether a fully-assembled request must NOT be dispatched.
+
+    Guard A for the context-blowup incident class (#context-blowup). Before a
+    request is sent, Hermes knows the estimated request tokens AND the resolved
+    model context window (``context_compressor.context_length``). When the
+    estimate EXCEEDS the window, dispatching is guaranteed to fail: the provider
+    rejects the payload or returns EMPTY output, and the caller's empty-response
+    retry loop re-sends the entire over-limit context for zero progress
+    (incident: ~365,063 estimated request tokens re-sent against a
+    262,144-token window on every retry).
+
+    Returns the resolved window (an ``int > 0``) when the request must be
+    refused — the caller treats any truthy return as "refuse, do not send".  It
+    returns ``None`` when dispatch is allowed:
+
+    * the resolved window is unknown (``context_length`` <= 0/absent) — we have
+      no basis to refuse;
+    * the estimate is within the window — normal dispatch;
+    * ``defer_preflight`` (the compressor's
+      ``should_defer_preflight_to_real_usage``) says the rough estimate is
+      known-noisy-HIGH relative to a recent REAL provider count that fit under
+      threshold — in that case we trust the real count rather than hard-block
+      on the over-counting guess.
+
+    Extracted as a pure module function so the refusal decision — the exact
+    logic Test 1/Test 2 pin — is unit-testable without constructing the whole
+    run loop.
+    """
+    window = int(getattr(compressor, "context_length", 0) or 0)
+    if window <= 0:
+        return None  # resolved window unknown — cannot classify as over-limit
+    if request_pressure_tokens <= window:
+        return None  # within window — normal dispatch
+    # Estimate exceeds the window. Honour the noisy-estimate deferral: if the
+    # compressor wants to trust a recent real usage count over this rough
+    # estimate (which over-counts schema overhead / post-compaction residue),
+    # do not hard-block on the guess.
+    try:
+        if defer_preflight(request_pressure_tokens):
+            return None
+    except Exception:
+        # A broken deferral must not silently remove the backstop — refused if
+        # we cannot rule out an over-limit guess (conservative).
+        pass
+    return window
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.handle_function_call`` / ``run_agent._set_interrupt`` /
@@ -2773,6 +2825,51 @@ def run_conversation(
                     int(getattr(_compressor, "threshold_tokens", 0) or 0),
                 )
         
+        # GUARD A — over-limit dispatch refusal (#context-blowup).
+        # Pre-API compaction ran above (when it was able to). If the fully
+        # assembled request STILL exceeds the resolved model window, dispatch
+        # is doomed: the provider either rejects it or returns empty output,
+        # and every empty-response retry re-sends the entire over-limit
+        # context for zero progress (incident: ~365k tokens re-sent against a
+        # 262k window). Refuse now — fail the turn with a clear operator-facing
+        # error rather than burn retries on a guaranteed-over-limit payload.
+        # Mirrors the ollama_runtime_context_too_small early-exit above
+        # (refund the never-made call/budget, then break the iteration loop).
+        _refuse_window = _should_refuse_over_limit_dispatch(
+            _compressor, request_pressure_tokens, _defer_preflight
+        )
+        if _refuse_window is not None:
+            logger.warning(
+                "Refusing over-limit dispatch for session %s: ~%s estimated "
+                "request tokens exceeds resolved context window of %s tokens; "
+                "failing the turn instead of re-sending an over-limit payload "
+                "on every retry",
+                getattr(agent, "session_id", None) or "none",
+                f"{request_pressure_tokens:,}",
+                f"{_refuse_window:,}",
+            )
+            final_response = (
+                "⚠️ The conversation has exceeded the model window "
+                f"(~{request_pressure_tokens:,} request tokens vs a "
+                f"{_refuse_window:,}-token window) and compression could not "
+                "bring it back under the limit. To protect this session from "
+                "repeated failed sends of an over-limit context, this turn was "
+                "not run. Use /compress to retry compression, /reset for a "
+                "clean session, or check your auxiliary.compression model "
+                "configuration so context can actually shrink."
+            )
+            failed = True
+            _turn_exit_reason = "over_limit_dispatch_refused"
+            append_message(messages, {"role": "assistant", "content": final_response})
+            agent._emit_status("❌ Over-limit request not dispatched — context exceeds model window")
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            break
+
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
         
