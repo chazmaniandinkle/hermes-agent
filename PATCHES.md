@@ -171,6 +171,36 @@ tracks exactly where each one sits in that pipeline.
 - **Re-merge-risk:** LOW — the extracted function is a straight lift of the original block's body (same logic, same env-var names, same local-variable names); the only behavioral change is *when* it runs (once, at `GatewayRunner.start()`, instead of at `import gateway.run`).
 - **Reconciler action:** watch `gateway/run.py`'s auxiliary-config-bridge region and `GatewayRunner.start()`'s top for upstream churn. Do not file upstream until the operator authorizes it (posting to `NousResearch/hermes-agent` is explicitly held). Separately worth a follow-up: `model_tools.py`'s module-scope `discover_plugins()` call (same antipattern, different module, not fixed here).
 
+#### `over-limit-dispatch-refusal`: never dispatch a request larger than the model window (`agent/conversation_loop.py`)
+- **Status:** LIVE on `local`, uncommitted at time of writing. Born 2026-09-15 from the usage-destruction incident.
+- **Files:** `agent/conversation_loop.py` (+97); `tests/agent/test_over_limit_dispatch_refusal.py`
+- **What:** Extracts a pure predicate `_should_refuse_over_limit_dispatch(compressor, request_pressure_tokens, defer_preflight)` and consults it immediately before dispatch. When the estimated request tokens exceed `context_compressor.context_length`, the turn FAILS with a clear operator message instead of sending; the never-made call is refunded and the loop `break`s — no dispatch, no retry. Incident context: ~365,063 estimated request tokens were re-sent against a 262,144-token window on every empty-response retry (`retry 1/3`, `retry 2/3`) for zero output. Returns `None` (allow) when the window is unknown, when the estimate fits, or when the compressor's `should_defer_preflight_to_real_usage` says the estimate is noisy-high against a real fit.
+- **Provenance:** 2026-09-15, post-incident. Evidence chain in `cog://mem/semantic/retrospectives/2026-09-15-usage-destruction-context-blowup`.
+- **Upstream refs:** none filed. **Upstream-worthy** — a guarded dispatch is correct for every provider. Awaiting operator go before filing.
+- **Test-delta notes:** 7 tests. **Negative control run by the parent (not the authoring lane):** neutering the predicate body (`return None` always) turns 3 tests red (`test_over_limit_request_is_refused`, `test_over_limit_refusal_is_round_trip`, `test_broken_deferral_keeps_backstop_conservative`) while 4 healthy-path tests stay green. File restored byte-identical (`sha 3a7b9e39f70c`). Anti-neutering case present: the within-window path must still dispatch.
+- **Re-merge-risk:** LOW-MEDIUM — additive guard adjacent to the existing pre-API compression block; mirrors the existing Ollama-too-small early-exit pattern.
+- **Reconciler action:** draft the upstream issue, then file.
+
+#### `compaction-abort-escalation`: stop re-sending after N consecutive compaction aborts (`gateway/run.py`)
+- **Status:** LIVE on `local`, uncommitted at time of writing.
+- **Files:** `gateway/run.py` (+139); `tests/gateway/test_hygiene_compaction_escalation.py`
+- **What:** Today `gateway/run.py` logs `Session hygiene compression ... made no progress ... continuing without compression` and **proceeds to send anyway** — the abort is swallowed, the context never shrinks, and every later turn re-sends the full over-limit context. Adds `_HYGIENE_ESCALATE_AFTER = 3`, pure `hygiene_abort_escalation_reached(streak, threshold)`, `_peek_hygiene_failure_streak` (0 on error, so a broken state store cannot wedge a session), `hygiene_escalation_user_message()`, and `SessionHygieneCompactionExhausted`. Reuses the EXISTING persistent per-session `hygiene_failure_streak` (already incremented on every abort, reset on recovery) rather than a parallel mechanism. First `threshold-1` aborts keep current behaviour; at/after, the session refuses to re-send and escalates with a distinct message.
+- **Provenance:** 2026-09-15, post-incident. The engine of the burn: 2/2 compaction attempts failed (`summary_generation_aborted`, 600.2s).
+- **Upstream refs:** none filed. **Upstream-worthy** — swallowing a failed compaction and proceeding is a defect independent of local config. Awaiting operator go.
+- **Test-delta notes:** 10 tests. **Negative control run by the parent:** neutering the predicate body (`return False`) turns 3 red (`test_nth_abort_escalates`, `test_streak_accrues_across_aborts_and_then_escalates`, `test_streak_resets_after_successful_compaction`) while 7 stay green; byte-identical restore confirmed. **Method note worth keeping:** neutering the module CONSTANT (`_HYGIENE_ESCALATE_AFTER` 3→4) changed NOTHING — the predicate takes `threshold` as a parameter and the tests supply their own, so a constant-level neuter probes the innocent layer. Negative-control the layer that DECIDES, not the value it defaults to.
+- **Re-merge-risk:** MEDIUM — threads through the session-hygiene path that upstream is actively refactoring (see `restart-ack-teardown-race` for the same neighbourhood).
+- **Reconciler action:** draft the upstream issue, then file.
+
+#### `mod3-streaming-provider`: local Mod³ TTS as a true streaming provider (`tools/tts_streaming.py`)
+- **Status:** LIVE in the tree, **INERT until the dashboard process restarts** (the speak-stream path resolves providers once per reply in the long-lived process). Not a defect fix.
+- **Files:** `tools/tts_streaming.py` (+118) — `@register("mod3")` `Mod3Streamer`.
+- **What:** Mod³'s `POST /v1/synthesize` with `format: pcm` returns bare little-endian int16 at 24 kHz — already the exact wire contract `StreamingTTSProvider` specifies, so there is no transcoding on either side. `available()` is a live `/health` probe rather than a credential check (the server is local and keyless), so a down server yields `None` from the resolver and the dispatcher cleanly falls back to the per-sentence sync path. `_check_sample_rate` verifies the server's reported rate against the announced one and warns loudly, because the WS `start` frame is sent from `sample_rate` before any audio arrives.
+- **Provenance:** 2026-09-15. Verified end-to-end: 170,760 B / 85,380 samples / 3.56 s of PCM, `ffprobe` = `pcm_s16le 24000 Hz mono`, peak amplitude 11,944 (not silence); negative control against a dead port → `available() False`, resolver `None`.
+- **Upstream refs:** **NOT upstream-worthy** — mod3 is local infrastructure; upstream has no such server. Keep local.
+- **Test-delta notes:** no upstream-facing tests; validated by the end-to-end probe above.
+- **Re-merge-risk:** LOW — additive registration conforming to the documented `@register("name")` extension point.
+- **Reconciler action:** none.
+
 ### NEEDS-WORK-TO-FILE — real upstream candidate, blocked on local work before submission
 
 #### `oauth-gate2-identity-relocation`: OAuth Gate 2 — relocate agent identity out of `system` field (`agent/anthropic_adapter.py`)

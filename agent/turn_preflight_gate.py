@@ -87,16 +87,50 @@ def run_preflight_gate(
             f"{_last_preflight_pressure:,}",
             f"{request_pressure_tokens:,}",
         )
-    return run_preflight_compression(
+    _defer_preflight = (
+        (lambda _t: False) if getattr(agent, "_request_pressure_anchored", False)
+        else getattr(_compressor, "should_defer_preflight_to_real_usage", lambda _t: False)
+    )
+    v = run_preflight_compression(
         agent, v, compressor=_compressor, request_pressure_tokens=request_pressure_tokens,
         provider_overflow_preflight=_provider_overflow_preflight,
         # An anchored figure is real usage + delta: never deferred. Only a whole-context rough
         # estimate waits for the provider's count.
-        defer_preflight=(
-            (lambda _t: False) if getattr(agent, "_request_pressure_anchored", False)
-            else getattr(_compressor, "should_defer_preflight_to_real_usage", lambda _t: False)
-        ),
+        defer_preflight=_defer_preflight,
         moa_prepared_request=_moa_prepared_request, system_message=system_message,
         user_message=user_message, max_compression_attempts=max_compression_attempts,
         effective_task_id=effective_task_id,
     )
+    if v.action != "fallthrough":
+        return v  # compaction changed the request (re-measure) or ended the turn
+    # over-limit-dispatch-refusal (local, 2026-09-15 usage-destruction incident): compaction had its
+    # chance; if the fully assembled request STILL exceeds the resolved window, dispatch is doomed
+    # (provider rejects or returns empty, and every empty-response retry re-sends the whole
+    # over-limit context). Fail the turn loudly and refund the never-made call instead.
+    from agent.conversation_loop import _should_refuse_over_limit_dispatch
+    _refuse_window = _should_refuse_over_limit_dispatch(_compressor, request_pressure_tokens, _defer_preflight)
+    if _refuse_window is not None:
+        logger.warning(
+            "Refusing over-limit dispatch for session %s: ~%s estimated request tokens exceeds "
+            "resolved context window of %s tokens; failing the turn instead of re-sending an "
+            "over-limit payload on every retry",
+            getattr(agent, "session_id", None) or "none", f"{request_pressure_tokens:,}", f"{_refuse_window:,}",
+        )
+        v.final_response = (
+            "⚠️ The conversation has exceeded the model window "
+            f"(~{request_pressure_tokens:,} request tokens vs a {_refuse_window:,}-token window) and "
+            "compression could not bring it back under the limit. To protect this session from "
+            "repeated failed sends of an over-limit context, this turn was not run. Use /compress to "
+            "retry compression, /reset for a clean session, or check your auxiliary.compression model "
+            "configuration so context can actually shrink."
+        )
+        v.failed = True
+        v._turn_exit_reason = "over_limit_dispatch_refused"
+        append_message(v.messages, {"role": "assistant", "content": v.final_response})
+        agent._emit_diagnostic_status("❌ Over-limit request not dispatched — context exceeds model window")
+        v.api_call_count -= 1
+        agent._api_call_count = v.api_call_count
+        with suppress(Exception):
+            agent.iteration_budget.refund()
+        v.action = "break"
+    return v

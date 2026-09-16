@@ -386,6 +386,60 @@ def _pressure_with_real_floor(compressor: Any, rough_tokens: int) -> int:
     return rough_tokens
 
 
+# over-limit-dispatch-refusal (local): pure decision predicate; consulted by
+# agent.turn_preflight_gate.run_preflight_gate after pre-API compaction.
+def _should_refuse_over_limit_dispatch(
+    compressor: Any,
+    request_pressure_tokens: int,
+    defer_preflight,
+) -> Optional[int]:
+    """Decide whether a fully-assembled request must NOT be dispatched.
+
+    Guard A for the context-blowup incident class (#context-blowup). Before a
+    request is sent, Hermes knows the estimated request tokens AND the resolved
+    model context window (``context_compressor.context_length``). When the
+    estimate EXCEEDS the window, dispatching is guaranteed to fail: the provider
+    rejects the payload or returns EMPTY output, and the caller's empty-response
+    retry loop re-sends the entire over-limit context for zero progress
+    (incident: ~365,063 estimated request tokens re-sent against a
+    262,144-token window on every retry).
+
+    Returns the resolved window (an ``int > 0``) when the request must be
+    refused — the caller treats any truthy return as "refuse, do not send".  It
+    returns ``None`` when dispatch is allowed:
+
+    * the resolved window is unknown (``context_length`` <= 0/absent) — we have
+      no basis to refuse;
+    * the estimate is within the window — normal dispatch;
+    * ``defer_preflight`` (the compressor's
+      ``should_defer_preflight_to_real_usage``) says the rough estimate is
+      known-noisy-HIGH relative to a recent REAL provider count that fit under
+      threshold — in that case we trust the real count rather than hard-block
+      on the over-counting guess.
+
+    Extracted as a pure module function so the refusal decision — the exact
+    logic Test 1/Test 2 pin — is unit-testable without constructing the whole
+    run loop.
+    """
+    window = int(getattr(compressor, "context_length", 0) or 0)
+    if window <= 0:
+        return None  # resolved window unknown — cannot classify as over-limit
+    if request_pressure_tokens <= window:
+        return None  # within window — normal dispatch
+    # Estimate exceeds the window. Honour the noisy-estimate deferral: if the
+    # compressor wants to trust a recent real usage count over this rough
+    # estimate (which over-counts schema overhead / post-compaction residue),
+    # do not hard-block on the guess.
+    try:
+        if defer_preflight(request_pressure_tokens):
+            return None
+    except Exception:
+        # A broken deferral must not silently remove the backstop — refused if
+        # we cannot rule out an over-limit guess (conservative).
+        pass
+    return window
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     runtime_ctx = getattr(agent, "_ollama_num_ctx", None)

@@ -2078,6 +2078,23 @@ class GatewayTurnMixin:
             history = await self._hmwa_run_session_hygiene(
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
             )
+            # compaction-abort-escalation (local, 2026-09-15 incident): once hygiene compaction has
+            # failed N consecutive times (the persistent hygiene_failure_streak, incremented by every
+            # abort/timeout and reset on recovery), stop re-dispatching an over-limit context: refuse
+            # the turn with a distinct message instead of "continuing without compression" forever.
+            from gateway.run import (
+                _HYGIENE_ESCALATE_AFTER, _peek_hygiene_failure_streak, hygiene_abort_escalation_reached,
+                hygiene_escalation_user_message,
+            )
+            _escal_streak = await asyncio.to_thread(_peek_hygiene_failure_streak, self, session_key)
+            if hygiene_abort_escalation_reached(_escal_streak):
+                logger.critical(
+                    "Session hygiene: compaction failed %s consecutive times for session %s "
+                    "(escalation threshold %s) — refusing to re-dispatch an over-limit context; "
+                    "aborting turn", _escal_streak, session_entry.session_id, _HYGIENE_ESCALATE_AFTER,
+                )
+                self._clear_session_env(_session_env_tokens)
+                return hygiene_escalation_user_message(_HYGIENE_ESCALATE_AFTER), _session_env_tokens
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
             return (

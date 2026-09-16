@@ -172,6 +172,82 @@ def _reset_hygiene_failure_streak(gateway, session_key: str) -> None:
             logger.debug("hygiene failure streak persistent reset failed: %s", exc)
 
 
+# Guard B — compaction-failure escalation (#context-blowup).
+#
+# Session hygiene tries to auto-compress an oversized transcript BEFORE the
+# turn runs. When that keeps aborting (summary model times out / returns no
+# output), the current behaviour is to warn and *continue without compression*
+# — so the turn then dispatches the full, over-limit context and the loop
+# re-sends it on every empty-response retry. That is safe for the FIRST couple
+# of aborts (transient provider blips) but must NOT repeat forever: if
+# compaction cannot reduce the context, the session must stop re-sending an
+# over-limit context.
+#
+# N = 3, chosen to mirror the existing failure-cooldown multiplier ladder
+# (_HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9), which caps its escalation
+# at a streak of 3) and the agent's max_compression_attempts (3). Two
+# consecutive failures can still be a transient blip; requiring three keeps
+# current behaviour for the first two real aborts and guarantees the session
+# stops burning full-context sends no later than the third. The count is the
+# existing persistent ``hygiene_failure_streak`` (rotation-stable per
+# session_key), which is already incremented on every abort and reset to 0 by
+# ``_reset_hygiene_failure_streak`` after a compaction that recovered context.
+_HYGIENE_ESCALATE_AFTER = 3
+
+
+class SessionHygieneCompactionExhausted(Exception):
+    """Raised after N consecutive compaction aborts to abort the turn.
+
+    Reuses the same dispatch-aborting pattern the hygiene TIMEOUT branch already
+    uses (``gateway/run.py`` raises out of ``_handle_message_with_agent`` on a
+    timeout so the oversized context is never re-dispatched). Raising here keeps
+    a wedged session from continuing into a fresh agent + full-context send once
+    compaction has provably failed N times in a row.
+    """
+
+
+def hygiene_abort_escalation_reached(
+    streak: int,
+    threshold: int = _HYGIENE_ESCALATE_AFTER,
+) -> bool:
+    """True once the consecutive-abort streak reaches ``threshold``.
+
+    First ``threshold - 1`` aborts keep current (warn-and-continue) behaviour;
+    at/after ``threshold`` the session must escalate loudly and stop re-sending.
+    ``threshold <= 0`` disables escalation (returns False) so operators can turn
+    it off.
+    """
+    if threshold <= 0:
+        return False
+    return streak >= threshold
+
+
+def _peek_hygiene_failure_streak(gateway, session_key: str) -> int:
+    """Read the current consecutive-abort streak, or 0 on any failure.
+
+    Returns 0 (never escalates) on error so a broken/missing state store cannot
+    wrongly wedge a session into refusing all turns.
+    """
+    try:
+        state = gateway._peek_session_state(session_key)
+        if state is None:
+            return 0
+        return int(getattr(state.persistent, "hygiene_failure_streak", 0) or 0)
+    except Exception:
+        return 0
+
+
+def hygiene_escalation_user_message(threshold: int = _HYGIENE_ESCALATE_AFTER) -> str:
+    """Distinct operator-facing message sent once escalation has triggered."""
+    return (
+        "⚠️ Context compression has failed "
+        f"{threshold} consecutive times and the session remains over the model "
+        "window. Auto-compaction can no longer reduce it, so this session is "
+        "refusing to re-send an over-limit context. Please /reset for a clean "
+        "session now, or fix your auxiliary.compression model configuration."
+    )
+
+
 def hygiene_compaction_recovered(
     *, aborted: bool, rotated: bool, in_place: bool, msg_count: int, new_count: int,
     approx_tokens: int, new_tokens: int) -> bool:
