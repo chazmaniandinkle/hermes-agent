@@ -21,6 +21,9 @@ logger = logging.getLogger("agent.conversation_loop")
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_thinking_prefill", "_empty_recovery_synthetic", "_empty_terminal_sentinel",
     "_dropped_toolcall_nudge",
+    # Ornith derail fix F2: the prefill scaffolding row only steers the next completion;
+    # the stitched final answer supersedes it.
+    "_length_truncation_prefill",
 )
 
 

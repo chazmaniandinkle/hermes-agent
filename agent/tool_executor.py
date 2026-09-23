@@ -44,6 +44,7 @@ from agent.tool_dispatch_helpers import (
     _append_subdir_hint_to_multimodal,
     _plan_tool_batch_segments,
     make_tool_result_message,
+    find_last_user_message_text,
 )
 from tools.terminal_tool_lifecycle import get_active_env
 from tools.thread_context import propagate_context_to_thread
@@ -60,6 +61,27 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 _LARGE_TOOL_RESULT_TRIM_CHARS = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_result_message_kwargs(agent, messages: list) -> dict:
+    """Shared ``make_tool_result_message`` kwargs for two Ornith-derail fixes:
+    fence-once-per-turn (#5) and the frame re-anchor (F4).
+
+    ``agent._untrusted_fence_state`` is a per-turn mutable dict reset in
+    ``turn_context._reset_per_turn_agent_state``; ``find_last_user_message_text``
+    re-derives "the live question" from the transcript itself.
+    """
+    if not getattr(agent, "_frame_reanchor_enabled", True):
+        reanchor_question = None
+    else:
+        reanchor_question = find_last_user_message_text(messages) or None
+    return {
+        "fence_state": getattr(agent, "_untrusted_fence_state", None),
+        "reanchor_question": reanchor_question,
+        "reanchor_threshold_bytes": getattr(
+            agent, "_frame_reanchor_threshold_bytes", 4096
+        ),
+    }
 
 
 _pairing_tool_call_id = coalesce_tool_call_id  # canonical id used by the persisted assistant message
@@ -1095,7 +1117,10 @@ def _commit_tool_result(
     # Multimodal dicts become an OpenAI-style content list; text-only servers get a
     # string-safe fallback so a rejected image result never poisons history.
     _tool_content = agent._tool_result_content_for_active_model(function_name, persisted_result)
-    tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
+    tool_message = make_tool_result_message(
+        function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition,
+        **_tool_result_message_kwargs(agent, messages),
+    )
     messages.append(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None

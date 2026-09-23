@@ -16,6 +16,14 @@ from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
+from agent.turn_failure_copy import stamp_failure
+from agent.turn_repetition_guard import (
+    REPETITION_WARNING_LINE,
+    RepetitionDecision,
+    RepetitionGuardConfig,
+    detect_text_repetition,
+    detect_tool_call_repetition,
+)
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -96,6 +104,35 @@ def run_tool_round(
     assistant_msg, duplicate_previous_interim = stage_tool_call_message(
         agent, assistant_message=assistant_message, finish_reason=finish_reason, messages=messages
     )
+
+    # Ornith derail fix F1: assistant repetition guard. Checked BEFORE this turn is
+    # appended/executed so a would-be third-in-a-row TEXT repeat never runs (mirrors the
+    # kernel agent loop's no-progress guard, limit 3). Tool-call repetition is WARN-ONLY:
+    # ``agent._tool_guardrails`` already owns halting on repeated tool calls with looser,
+    # deliberately tuned thresholds; a second, stricter halt here would race ahead of it.
+    _rep_decision = check_assistant_repetition(agent, assistant_message, assistant_msg, messages)
+    if _rep_decision.should_halt:
+        _turn_exit_reason = "repetition_guard_halt"
+        final_response = _rep_decision.message
+        agent._emit_status(
+            f"⚠️ Repetition guard halted turn: {_rep_decision.kind} x{_rep_decision.occurrences}"
+        )
+        append_message(messages, {"role": "assistant", "content": final_response})
+        if agent.stream_delta_callback:
+            with suppress(Exception):
+                agent.stream_delta_callback(final_response)
+                agent.stream_delta_callback(None)
+        agent._cleanup_task_resources(effective_task_id)
+        agent._persist_session(messages, conversation_history)
+        return _verdict("return", stamp_failure({
+            "final_response": final_response,
+            "messages": messages,
+            "api_calls": api_call_count,
+            "completed": False,
+            "partial": True,
+            "error": f"repetition_guard_halt: {_rep_decision.kind}",
+        }, "loop_error", False))
+
     append_message(messages, assistant_msg)
 
     # Mixed batch: error-result invalid calls and drop them from execution.
@@ -175,6 +212,17 @@ def run_tool_round(
                     agent.stream_delta_callback(None)
         return _verdict("break")
 
+    # Ornith derail fix F1, first duplicate (occurrence 2): the tool call(s) already ran
+    # -- rewriting history to skip them would lose real side effects -- so inject the
+    # one-line corrective nudge now for the NEXT completion call to see.
+    if _rep_decision.should_warn:
+        messages.append({
+            "role": "user",
+            "content": _rep_decision.message,
+            "_repetition_guard_synthetic": True,
+        })
+        agent._session_messages = messages
+
     # Reset per-turn retry counters so one truncation can't poison the turn.
     truncated_tool_call_retries = 0
     # Defer the paragraph break: _fire_stream_delta() prepends one "\n\n" when real
@@ -212,6 +260,29 @@ def run_tool_round(
     # the gateway kills the session before the next activity touch fires (#69559, #69131).
     agent._touch_activity(f"tool results posted, continuing iteration #{api_call_count}")
     return _verdict("continue")
+
+
+def check_assistant_repetition(
+    agent: Any, assistant_message: Any, assistant_msg: Dict[str, Any], messages: Any
+) -> RepetitionDecision:
+    """Ornith derail fix F1 decision layer: compare the about-to-be-emitted assistant turn
+    (narration text, or -- with no narration -- its tool-call set) against the preceding
+    assistant turns already in ``messages``. Stateless: derived from the transcript,
+    because gateway sessions rebuild the AIAgent every turn. Tool-call halts are
+    downgraded to warnings (the tool guardrail owns halting on repeated calls)."""
+    cfg = getattr(agent, "_repetition_guard_config", None) or RepetitionGuardConfig()
+    narration = assistant_message.content or ""
+    if narration.strip():
+        return detect_text_repetition(messages, narration, cfg)
+    decision = detect_tool_call_repetition(messages, assistant_msg.get("tool_calls") or [], cfg)
+    if decision.should_halt:
+        decision = RepetitionDecision(
+            action="warn",
+            occurrences=decision.occurrences,
+            kind=decision.kind,
+            message=REPETITION_WARNING_LINE,
+        )
+    return decision
 
 
 def stage_tool_call_message(

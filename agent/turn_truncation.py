@@ -250,18 +250,36 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
     st.length_continue_retries += 1
     n = st.length_continue_retries
     _interim_content = getattr(assistant_message, "content", None)
+    _dropped_tools = getattr(st.response, "_dropped_tool_names", None)
+    # Ornith derail fix F2: only the plain output-length-cap case (not a network stub,
+    # not a mid-tool-call stall) with visible text is a candidate for mechanical
+    # continuation: resend with the truncated text as a trailing assistant turn instead
+    # of asking the model to remember where it left off.
+    _use_prefill = (
+        bool(_interim_content)
+        and not st.is_stub
+        and not _dropped_tools
+        and str(getattr(agent, "_truncation_continuation_mode", "prefill")) == "prefill"
+    )
     if not _interim_content and not st.is_stub:
         # Thinking-only truncation: continuing with thinking ON re-burns the budget.
         agent._ephemeral_reasoning_off = True
     if _interim_content:
         interim_msg = agent._build_assistant_message(assistant_message, st.finish_reason)
         interim_msg["_length_continuation_fragment"] = True  # ceiling exit drops these
+        if _use_prefill:
+            # Popped before the final append (turn_final_response scaffolding flags).
+            interim_msg["_length_truncation_prefill"] = True
         append_message(messages, interim_msg)
         st.truncated_response_parts.append(_interim_content)
 
     filled = st.window_filled
+    if n < 4 and filled is None and _use_prefill:
+        agent._vprint(f"{agent.log_prefix}↻ Requesting continuation via prefill ({n}/4)...", diagnostic=True)
+        agent._session_messages = messages
+        _retry.restart_with_length_continuation = True
+        return st.done("break")
     if n < 4 and filled is None:
-        _dropped_tools = getattr(st.response, "_dropped_tool_names", None)
         if st.is_stub and _dropped_tools:
             agent._vprint(
                 f"{agent.log_prefix}↻ Stream interrupted mid "
@@ -272,7 +290,8 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         else:
             agent._vprint(f"{agent.log_prefix}↻ Requesting continuation ({n}/4)...", diagnostic=True)
         append_message(messages, {
-            "role": "user", "content": _get_continuation_prompt(st.is_stub, _dropped_tools),
+            "role": "user",
+            "content": _get_continuation_prompt(st.is_stub, _dropped_tools, truncated_tail=_interim_content),
             "_length_continuation_nudge": True,
         })
         agent._session_messages = messages

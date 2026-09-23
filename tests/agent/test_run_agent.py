@@ -3389,7 +3389,12 @@ class TestRunConversation:
         ]
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
-        assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
+        # startswith rather than == : Ornith derail fix F3 (tool inventory pinning)
+        # appends a "[Available tools: ...]" reminder to the last api message.
+        assert any(
+            msg.get("role") == "user" and str(msg.get("content", "")).startswith("search something")
+            for msg in pre_request_calls[0]["request_messages"]
+        )
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
@@ -4049,6 +4054,10 @@ class TestRunConversation:
         """A corrective follow-up does not end the turn, and displayed reasoning
         never re-enters the transcript (classifier-poisoning guard)."""
         self._setup_agent(agent)
+        # Ornith derail fix F3 appends "[Available tools: ...]" to the last
+        # api message each turn; this test asserts exact message content for
+        # unrelated machinery, so pin off (the pin has its own coverage).
+        agent._tool_inventory_pinning_enabled = False
         agent.reasoning_callback = lambda _text: None
         final = _mock_response(content="Using Postgres instead.", finish_reason="stop")
         requests = []
@@ -4469,9 +4478,12 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert result["final_response"] == "Part 1 Part 2"
 
+        # Ornith derail fix F2: truncation continuation defaults to mechanical prefill
+        # (resend with the truncated text as a trailing assistant turn) rather than an
+        # instructional "continue exactly where you left off" user message.
         second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
-        assert second_call_messages[-1]["role"] == "user"
-        assert "truncated by the output length limit" in second_call_messages[-1]["content"]
+        assert second_call_messages[-1]["role"] == "assistant"
+        assert second_call_messages[-1]["content"].startswith("Part 1")
 
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
@@ -4544,9 +4556,10 @@ class TestRunConversation:
             == "Based on the search results, the best next step is to update the config."
         )
 
+        # Ornith derail fix F2: mechanical prefill, not an instructional continue-message.
         third_call_messages = agent.client.chat.completions.create.call_args_list[2].kwargs["messages"]
-        assert third_call_messages[-1]["role"] == "user"
-        assert "truncated by the output length limit" in third_call_messages[-1]["content"]
+        assert third_call_messages[-1]["role"] == "assistant"
+        assert third_call_messages[-1]["content"].startswith("Based on the search results, the best next")
 
     @pytest.mark.parametrize("base_url, model", [
         ("https://ollama.com/v1", "glm-5.3-flash"),      # Ollama Cloud host (#72316)
@@ -5090,6 +5103,10 @@ class TestRunConversation:
         restart_with_compressed_messages without ever calling the compressor.
         """
         self._setup_agent(agent)
+        # Ornith derail fix F3 appends "[Available tools: ...]" to the last
+        # api message each turn; this test asserts exact message content for
+        # unrelated machinery, so pin off (the pin has its own coverage).
+        agent._tool_inventory_pinning_enabled = False
         agent.api_mode = "chat_completions"
         agent.provider = "openrouter"
         agent.model = "some/model"

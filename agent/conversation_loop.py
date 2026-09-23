@@ -895,8 +895,24 @@ _LENGTH_CONTINUATION_OUTPUT_LIMIT = (
 # The dropped-tools variant interpolates tool names; matched by prefix.
 _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
 
+# Stable prefix of the tail-bearing output-limit variant below (Ornith derail fix F2) so
+# _is_synthetic_compression_user_turn can recognize it by prefix, like the dropped-tools one.
+_LENGTH_CONTINUATION_TAIL_PREFIX = (
+    "[System: Your previous response was truncated by the output "
+    "length limit. It ended with:"
+)
 
-def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
+# Ornith derail fix F2: tail of the truncated text included in the instruction fallback,
+# when the provider path can't do a real trailing-assistant prefill. Short enough to stay
+# a hint, not a second copy of the truncated response (already in ``messages``).
+_TRUNCATION_TAIL_CHARS = 300
+
+
+def _get_continuation_prompt(
+    is_partial_stub: bool,
+    dropped_tools: Optional[List[str]] = None,
+    truncated_tail: Optional[str] = None,
+) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
         return (
@@ -906,7 +922,44 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
             "calls (e.g. use multiple patch calls or write smaller files). Each tool call's "
             "arguments must be under ~8K tokens to avoid stream timeouts.]"
         )
-    return _LENGTH_CONTINUATION_NETWORK_STUB if is_partial_stub else _LENGTH_CONTINUATION_OUTPUT_LIMIT
+    if is_partial_stub:
+        return _LENGTH_CONTINUATION_NETWORK_STUB
+    # Ornith derail fix F2: the bare "continue exactly where you left off" instruction was
+    # observed producing a restart from the top on a local model under load. Prefill (see
+    # agent.turn_truncation._continue_text) is the primary fix; this text-only path is the
+    # fallback for providers that reject a trailing-assistant request, and it gives the
+    # model the literal tail to key off instead of only a verbal instruction.
+    tail = (truncated_tail or "").strip()
+    if tail:
+        tail = tail[-_TRUNCATION_TAIL_CHARS:]
+        return (
+            _LENGTH_CONTINUATION_TAIL_PREFIX + " \"...\n" + tail + "\"\n"
+            "Continue directly from that exact point. Do not restart, "
+            "repeat prior text, or re-summarize what came before.]"
+        )
+    return _LENGTH_CONTINUATION_OUTPUT_LIMIT
+
+
+def _build_tool_inventory_pin(tools: Optional[List[Dict[str, Any]]]) -> str:
+    """Build the one-line, names-only tool-inventory reminder (Ornith derail fix F3).
+    Returns "" when there are no tools to pin.
+
+    Names only -- the full schema is already in the ``tools=`` API field and the system
+    prompt; this line exists purely as a recency anchor, so it stays minimal.
+    """
+    if not tools:
+        return ""
+    names: List[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if isinstance(name, str) and name:
+            names.append(name)
+    if not names:
+        return ""
+    return "\n\n[Available tools: " + ", ".join(names) + "]"
 
 
 # Codex/Responses turns that returned only internal reasoning: a bare retry would be

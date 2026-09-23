@@ -559,6 +559,8 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
     ("_last_content_with_tools", None), ("_last_content_tools_all_housekeeping", False),
     ("_mute_post_response", False), ("_unicode_sanitization_passes", 0),
     ("_tool_guardrail_halt_decision", None),
+    # Ornith derail fix F1: the repetition guard's halt flag is turn-scoped.
+    ("_repetition_guard_halt_decision", None),
     ("_iteration_budget_warning_injected", False),
     ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0),
     ("_pre_verify_nudges", 0),
@@ -572,6 +574,8 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
     agent._tool_guardrails.reset_for_turn()
+    # Ornith derail fix #5: fence-once-per-turn state is a fresh mutable dict every turn.
+    agent._untrusted_fence_state = {"used": False}
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()
@@ -1199,6 +1203,10 @@ def build_api_messages(
         # Strip length-continuation marks; some transports keep underscore keys.
         api_msg.pop("_length_continuation_fragment", None)
         api_msg.pop("_length_continuation_nudge", None)
+        # Ornith derail markers: F1 repetition-guard nudge (content is sent as-is) and the
+        # F2 length-truncation prefill (the trailing assistant row itself IS sent).
+        api_msg.pop("_repetition_guard_synthetic", None)
+        api_msg.pop("_length_truncation_prefill", None)
         # Strip Codex Responses fields (call_id, response_item_id): strict providers
         # reject unknown fields. New dicts keep the internal list intact for Codex.
         if agent._should_sanitize_tool_calls():

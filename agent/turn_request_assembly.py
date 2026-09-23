@@ -187,6 +187,31 @@ def assemble_api_request(
     # they crash json.dumps() inside the OpenAI SDK and trigger the 3-retry cycle.
     _sanitize_messages_surrogates(api_messages)
 
+    # Ornith derail fix F3: tool inventory pinning. Recency beats primacy for small
+    # models: under enough retrieval volume a local model was observed flatly denying it
+    # had a tool it had just used four times. A one-line, names-only reminder at the very
+    # end of context assembly is cheap insurance. Appended to the last message's own
+    # content (not a new message) so role-alternation-strict providers are undisturbed.
+    if getattr(agent, "_tool_inventory_pinning_enabled", True):
+        from agent.conversation_loop import _build_tool_inventory_pin
+
+        _pin_line = _build_tool_inventory_pin(agent.tools)
+        if _pin_line and api_messages:
+            _last_api_msg = api_messages[-1]
+            _last_content = _last_api_msg.get("content")
+            if isinstance(_last_content, str):
+                _last_api_msg["content"] = _last_content + _pin_line
+            elif isinstance(_last_content, list):
+                _appended = False
+                for _idx in range(len(_last_content) - 1, -1, -1):
+                    _part = _last_content[_idx]
+                    if isinstance(_part, dict) and _part.get("type") == "text" and isinstance(_part.get("text"), str):
+                        _last_content[_idx] = {**_part, "text": _part["text"] + _pin_line}
+                        _appended = True
+                        break
+                if not _appended:
+                    _last_content.append({"type": "text", "text": _pin_line.strip()})
+
     # No send-time pad loop here: ``repair_empty_non_final_messages`` (inside
     # ``_sanitize_api_messages``) is the single owner of empty-turn repair.
 

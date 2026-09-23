@@ -142,6 +142,33 @@ DEFAULT_CONFIG = {
         # "auto" = gpt/codex models; true/false = force for all models; or a list of model-name
         # substrings (e.g. ["gpt", "codex", "gemini", "qwen"]).
         "tool_use_enforcement": "auto",
+        # Ornith derail case-study fix F1 (2026-07-29): a local seat under retrieval
+        # pressure re-converges to its last known-good text and repeats it verbatim.
+        # First duplicate -> one corrective line; second consecutive duplicate -> halt
+        # the tool loop for that turn (mirrors the kernel's no-progress guard, limit 3).
+        "assistant_repetition_guard": {
+            "enabled": True,
+            "warn_after": 2,   # occurrences (2 = first duplicate)
+            "halt_after": 3,   # occurrences (3 = second consecutive duplicate)
+            "near_duplicate_threshold": 0.92,  # normalized similarity ratio
+        },
+        # Ornith derail fix F4: after a tool result larger than threshold_bytes, append
+        # one minimal line naming the live user question ("frame capture" guard).
+        "frame_reanchor": {
+            "enabled": True,
+            "threshold_bytes": 4096,
+        },
+        # Ornith derail fix F3: re-inject a compact tool-name-only list near the end of
+        # context assembly each turn (recency beats primacy for small models).
+        "tool_inventory_pinning": {
+            "enabled": True,
+        },
+        # Ornith derail fix F2: "prefill" resends the truncated text as a trailing
+        # assistant turn (mechanical continuation); "instruction" uses the older
+        # "continue exactly where you left off" nudge with the truncated tail appended.
+        "truncation_continuation": {
+            "mode": "prefill",  # "prefill" | "instruction"
+        },
         # Execution-discipline prompt block (tool persistence, tools for arithmetic/system facts,
         # read-back after external writes, count reconciliation, literal identifiers,
         # verification-gated completion). Chosen once per session by model name (byte-stable).

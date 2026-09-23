@@ -36,6 +36,7 @@ from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig, ToolCallGuardrailController
 )
+from agent.turn_repetition_guard import RepetitionGuardConfig
 from hermes_cli.config import cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
@@ -1205,6 +1206,58 @@ def _apply_display_config(agent, _agent_cfg, platform):
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+
+
+def _apply_ornith_mitigations(agent, _agent_cfg) -> None:
+    """Ornith derail case-study fixes (F1-F5). See
+    /Users/slowbro/workspaces/cog/.cog/mem/working/2026-07-29-ornith-derail-case-study/CASE-STUDY.md."""
+    # F1: assistant repetition guard. Detects an assistant turn (text or tool call) that
+    # is an exact/near-exact duplicate of the immediately preceding one and nudges/halts
+    # the tool loop -- mirrors the kernel agent loop's no-progress guard.
+    try:
+        agent._repetition_guard_config = RepetitionGuardConfig.from_mapping(
+            _agent_cfg.get("assistant_repetition_guard", {})
+        )
+    except Exception as _rg_err:
+        _ra().logger.warning("Assistant repetition guard config ignored: %s", _rg_err)
+        agent._repetition_guard_config = RepetitionGuardConfig()
+    agent._repetition_guard_halt_decision = None
+
+    # F4: frame re-anchor. After a big tool result, append one minimal line naming the
+    # live user question so a long retrieval's own discourse can't displace the actual
+    # conversation (see agent.tool_dispatch_helpers.make_tool_result_message).
+    _frame_reanchor_cfg = _agent_cfg.get("frame_reanchor", {}) or {}
+    if not isinstance(_frame_reanchor_cfg, dict):
+        _frame_reanchor_cfg = {}
+    agent._frame_reanchor_enabled = bool(_frame_reanchor_cfg.get("enabled", True))
+    try:
+        agent._frame_reanchor_threshold_bytes = int(
+            _frame_reanchor_cfg.get("threshold_bytes", 4096) or 4096
+        )
+    except (TypeError, ValueError):
+        agent._frame_reanchor_threshold_bytes = 4096
+
+    # F3: tool inventory pinning. Recency beats primacy for small models -- re-inject a
+    # compact tool-name-only list near the end of context assembly each turn.
+    _tool_pin_cfg = _agent_cfg.get("tool_inventory_pinning", {}) or {}
+    if not isinstance(_tool_pin_cfg, dict):
+        _tool_pin_cfg = {}
+    agent._tool_inventory_pinning_enabled = bool(_tool_pin_cfg.get("enabled", True))
+
+    # F2: truncation-continuation mode. "prefill" resends the truncated text as a
+    # trailing assistant turn (mechanical continuation); "instruction" falls back to the
+    # older "continue exactly where you left off" nudge (with the truncated tail
+    # appended) for providers that reject/mishandle a trailing-assistant request.
+    _trunc_cont_cfg = _agent_cfg.get("truncation_continuation", {}) or {}
+    if not isinstance(_trunc_cont_cfg, dict):
+        _trunc_cont_cfg = {}
+    agent._truncation_continuation_mode = str(
+        _trunc_cont_cfg.get("mode", "prefill") or "prefill"
+    ).strip().lower()
+
+    # Fix #5: fence-once-per-turn. Mutable per-turn state (reset in turn_context.py)
+    # tracking whether the full <untrusted_tool_result> fence was emitted this turn.
+    agent._untrusted_fence_state = {"used": False}
 
 
 def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
@@ -2427,6 +2480,7 @@ def init_agent(
         _agent_cfg = {}
 
     _apply_display_config(agent, _agent_cfg, platform)
+    _apply_ornith_mitigations(agent, _agent_cfg)
     _init_memory(agent, _agent_cfg, skip_memory, platform)
     _apply_agent_section(agent, _agent_cfg)
     cs = _parse_compression_config(agent, _agent_cfg)
