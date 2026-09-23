@@ -1,0 +1,21 @@
+pick f15125253c8b8ea041643f283859480126040be1 # Add frame re-anchor after large tool results (F4)
+pick 208d223b105ac2806c627eeffbfee5296d652df5 # Pin the tool inventory near the end of context each turn (F3)
+pick b23f6c4be1f4bccc6212cdd09240c61a3a6cf51b # Switch truncation continuation to mechanical prefill (F2)
+pick a12b572eb2128de6e4f94d0c623f32f729fbc051 # Fence untrusted tool results once per turn, not once per result (fix #5)
+pick 13e1f141caf45b4ee7421399f7eccfbcd43bce6f # Log PATCH-015 in the patch registry for the Ornith derail fix series
+pick 55486203084c8591a90b2b54439c34a836ea8f51 # PATCH-016: model-class gate for the F3/F4 Ornith mitigations
+pick f75eb8972f35e2bbd1df863e59cdbec1cc3fe4de # PATCH-016 (2/2): fail-closed consumers + AUTO sentinel — the gate was never consulted
+pick a07135220cd47849f2b025ab17ea2356966ee68b # PATCH-017: anchor the OAuth hermes-agent slug replace (upstream #48860 / PR #48868)
+pick eab7e6011d4d63b25ad831599859621940f66cf8 # PATCH-018: rename repetition_guard -> turn_repetition_guard (add/add collision)
+pick 5d8b4fa9bede758409488f3e85d987e9f1921bd6 # PATCH-017: record upstream comment filed on #48860
+pick ea5165e06ac81230b5b1ebf791f2ce39855d5102 # PATCHES.md: slugs replace numbers as patch identity
+pick 4b4a9fe530ee9e09b949a633585978add80f59a0 # PATCHES.md: drop Legacy-ID, slug the prose refs too
+pick 2911b5300fe26bab0f587925accdadd0c38dff37 # PATCHES.md: retire progressive-memory-eviction-test-deltas — upstream deleted the xfail-marked tests at v2026.8.18; pick 55b89aebc dropped as empty during the 2026-08-19 resync
+pick 1b97622bd5279de2dd027531440424480cd8b2b4 # fix(gateway): defer plugin-auxiliary-env bridging out of gateway.run's import-time module scope
+pick e3de5cf7b8da9a16640fa7b8d590360af7ca6759 # PATCHES.md: register fix-gateway-run-import-lock-plugin-discovery
+pick e913e8251f648b09e7c737ad907d49562822033e # PATCHES.md: History row for fix-gateway-run-import-lock-plugin-discovery
+pick 30e5973e29c69568653c7c9ddc1412b107235f5e # PATCHES.md: record PR number for fix-gateway-run-import-lock-plugin-discovery
+pick 9df516e1b0caec27540e31676ca684c53bce8134 # docs(PATCHES): fix record-accuracy defects in fix-gateway-run-import-lock-plugin-discovery entry
+pick 0345db578d825a359926ac6c92386ad0b0f033aa # test: close audio-playback guard hole that let pytest speak through the speakers
+pick 83b435b451d566ea9fbce5ee2d78468df63138d2 # fix: refuse over-limit dispatch + escalate repeated compaction aborts
+pick 1a2e14c806571ba8d274a43f64517766463079ac # fix(agent_init): read F3/F4 mitigation flags from the agent: section
