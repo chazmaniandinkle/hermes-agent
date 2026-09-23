@@ -121,3 +121,56 @@ for j in darkstar vega theseus cog; do launchctl kickstart -k gui/$(id -u)/ai.he
 5. The go-live procedure is untested.
 6. The probe edit sits in the Cog workspace and is uncommitted. The sessiondb probe's import-provenance leak needs fixing before its verdict can be trusted.
 7. Four gateways restart at go-live, not three (theseus was missing from the brief).
+
+---
+
+## Session 2 (2026-09-23, subagent): Ornith series ported
+
+**Summary:** the Ornith series and 1a2e14c806 are now carried on `resync-v2026.9.21`. All three Ornith probes read CONFORMANT on the resync tree and NOT-APPLICABLE on upstream v2026.9.21. tool-inventory-pinning **CASE 5 passes**. No gateway, serve or dashboard process was touched. `runtime/current` was not repointed, and the live checkout was not edited.
+
+### (h) Port status per slug
+| slug | commit(s) | re-anchored onto |
+|---|---|---|
+| `ornith-derail-tier1-fixes` (F1-F5) | 0585ce06f5, wiring tests 01ec4757d6 | F1: `turn_tool_round.run_tool_round` + new `check_assistant_repetition()`; reset in `turn_context._PER_TURN_RESET_STATE`. F3: `turn_request_assembly.assemble_api_request` (after surrogate sanitize); builder stays `conversation_loop._build_tool_inventory_pin`. F4 + #5: `tool_dispatch_helpers.make_tool_result_message`; kwargs wired into `tool_executor._commit_tool_result` (upstream's single commit point for concurrent + sequential). F2: `turn_truncation._continue_text`; `_length_truncation_prefill` added to `turn_final_response._EPHEMERAL_SCAFFOLDING_FLAGS`; `_LENGTH_CONTINUATION_TAIL_PREFIX` recognised in `context_compressor`. agent_init: new `_apply_ornith_mitigations()` called after `_apply_display_config`. |
+| `ornith-model-class-gate` (2 commits) | d46c6055c6 | `_small_model_mitigations_default` verbatim; AUTO sentinel `None` in DEFAULT_CONFIG; fallbacks fail closed. |
+| 1a2e14c806 `_mitigation_section` | ef5498dc8f (code), 7a260984a3 (PATCHES.md) | verbatim |
+| `turn-repetition-guard-rename` | d7816d8ec6 | The guard is created directly at `agent/turn_repetition_guard.py`, so upstream's `agent/repetition_guard.py` is untouched. It also carries `tests/plugins/test_skill_relevance_gate.py`, which rode along in eab7e6011d (6 passed). |
+| `oauth-credential-read-only` test contract | c8c9213eb7 | Three tests are marked strict-xfail: `test_credential_pool_anthropic_refresh_race.py::test_concurrent_claude_code_refresh_recovers_via_credentials_file` (new upstream); `test_anthropic_keychain.py::TestRefreshOAuthTokenAdoptsFreshCredential::test_falls_back_to_network_refresh_when_no_fresh_credential` (re-xfail of de02c19051); and `::test_concurrent_refreshes_use_one_shared_credentials_lock` (new upstream, the same POST/write contract; this third one was not in the brief). |
+
+### (i) Verification
+- **Probe verdict matrix** (driver `.resync/rs-probe-matrix.sh`, exit codes UNPIPED):
+
+| probe | upstream v2026.9.21 | pre-resync 1a2e14c806 | resync @0585ce06f5 (F1-F5, no gate) | resync @d46c6055c6 (gate, no read fix) | resync HEAD |
+|---|---|---|---|---|---|
+| frame-reanchor | NOT-APPLICABLE (3) | CONFORMANT | NON-CONFORMANT (fail-open fallback) | CONFORMANT | CONFORMANT (0) |
+| tool-inventory-pinning | NOT-APPLICABLE (3) | CONFORMANT | NON-CONFORMANT (3 cases) | NON-CONFORMANT, **CASE 5 only** | CONFORMANT (0), **CASE 5 pass** |
+| turn-repetition-guard | NOT-APPLICABLE (3) | CONFORMANT | CONFORMANT | CONFORMANT | CONFORMANT (0) |
+
+- **Neuter controls:**
+  - Disabling `_is_near_duplicate` turns the turn-repetition-guard probe red (3 cases); restoring it turns the probe green.
+  - The probes do not check wiring, so `tests/agent/test_ornith_wiring.py` (7 tests, through `run_conversation`) was added. `.resync/rs-neuter-ornith.sh` makes three mutations, and each turns exactly its matching test red: removing the F1 halt, flipping the F3 fallback to True, and dropping the F4 kwargs.
+- **Real config read:** `load_config_readonly()` on profile cog with a localhost:6931 endpoint resolves pin and re-anchor to False/False.
+- **Slug test files:**
+  - `test_turn_repetition_guard.py` + `test_tool_dispatch_helpers.py` + `tests/agent/test_run_agent.py`: 362 passed.
+  - `test_ornith_wiring.py`: 7 passed.
+  - `test_skill_relevance_gate.py`: 6 passed.
+- **Note:** this worker's own tool results carried `[Available tools: ...]` footers throughout the session. That is the live pin (`v2026.8.18-local.2911b53`) exhibiting the exact read-path bug 1a2e14c806 fixes. It stops only at go-live.
+
+### (j) Test failure-set diff: IN PROGRESS at the time of writing
+- **Pre run:** `/tmp/rs-pre` via `/tmp/rs-runtests.sh`, pid 22775, ~95% after 1h. It writes `/tmp/rs-base-pre.fail`.
+- **Post run:** `.resync/rs-runtests-post.sh`. It is the same suite with v2026.9.21's moved paths: `tests/run_agent` merged into `tests/agent` (170 of 183 files moved), and `tests/test_hermes_state.py` moved to `tests/hermes_state/test_hermes_state.py`.
+  - The original runner exits 4 on the resync tree because `tests/run_agent` is gone. Do not use it for POST.
+  - The post run writes `/tmp/rs-post.fail`.
+- **Upstream reference run** (`/tmp/rs-up`): it died with a **segfault** (exit 139) in a `title_generator` → `_emit_warning` background thread. That is upstream code, not a carry. It is not needed for the diff, and it can be rerun if a post-only failure needs attribution.
+- **Resume:**
+  ```
+  comm -13 /tmp/rs-base-pre.fail /tmp/rs-post.fail   # new failures
+  comm -23 /tmp/rs-base-pre.fail /tmp/rs-post.fail   # fixed / gone
+  ```
+  - First normalise the moved paths: `sed 's#^tests/run_agent/#tests/agent/#; s#^tests/test_hermes_state.py#tests/hermes_state/test_hermes_state.py#'` on the pre set.
+  - Many "fixed" entries will be tests upstream deleted or renamed (the wave-1 prune). Name them, don't count them.
+
+### (k) Still open (NOT decided here; Chaz's call)
+- (a) `cron-teardown-orphan-race`: upstream's `add_done_callback` deferral vs our `HERMES_CRON_TEARDOWN_HARDCAP` timer + early `kill_all`.
+- (b) `sessiondb-write-none-guard` drop: its probe leaks imports into the live checkout's `hermes_bootstrap`, so its upstream verdict is void until the probe is fixed.
+- The go-live procedure in (f) is still untested. The four gateways restart; cog restarts LAST.
