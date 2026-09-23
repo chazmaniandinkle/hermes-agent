@@ -1854,7 +1854,22 @@ def init_agent(
             return _mitigation_default
         return bool(value)
 
-    _frame_reanchor_cfg = _agent_cfg.get("frame_reanchor", {}) or {}
+    # These sections live under ``agent:`` (DEFAULT_CONFIG["agent"] and the
+    # profile's config.yaml). ``_agent_cfg`` is the WHOLE merged config, so a
+    # top-level-only read always missed, an explicit ``enabled: false`` was
+    # silently ignored, and the model-class gate decided alone. Read the
+    # ``agent`` section first; keep the top-level key as a legacy fallback.
+    _agent_section = _agent_cfg.get("agent", {})
+    if not isinstance(_agent_section, dict):
+        _agent_section = {}
+
+    def _mitigation_section(name: str) -> dict:
+        sec = _agent_section.get(name)
+        if sec is None:
+            sec = _agent_cfg.get(name)
+        return sec if isinstance(sec, dict) else {}
+
+    _frame_reanchor_cfg = _mitigation_section("frame_reanchor")
     if not isinstance(_frame_reanchor_cfg, dict):
         _frame_reanchor_cfg = {}
     agent._frame_reanchor_enabled = _resolve_mitigation_flag(_frame_reanchor_cfg)
@@ -1868,7 +1883,7 @@ def init_agent(
     # Ornith derail case-study fix F3: tool inventory pinning. Recency
     # beats primacy for small models -- re-inject a compact tool-name-only
     # list near the end of context assembly each turn.
-    _tool_pin_cfg = _agent_cfg.get("tool_inventory_pinning", {}) or {}
+    _tool_pin_cfg = _mitigation_section("tool_inventory_pinning")
     if not isinstance(_tool_pin_cfg, dict):
         _tool_pin_cfg = {}
     agent._tool_inventory_pinning_enabled = _resolve_mitigation_flag(_tool_pin_cfg)
