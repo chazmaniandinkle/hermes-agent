@@ -157,8 +157,8 @@ for j in darkstar vega theseus cog; do launchctl kickstart -k gui/$(id -u)/ai.he
 - **Note:** this worker's own tool results carried `[Available tools: ...]` footers throughout the session. That is the live pin (`v2026.8.18-local.2911b53`) exhibiting the exact read-path bug 1a2e14c806 fixes. It stops only at go-live.
 
 ### (j) Test failure-set diff: IN PROGRESS at the time of writing
-- **Pre run:** `/tmp/rs-pre` via `/tmp/rs-runtests.sh`, pid 22775, ~95% after 1h. It writes `/tmp/rs-base-pre.fail`.
-- **Post run:** `.resync/rs-runtests-post.sh`. It is the same suite with v2026.9.21's moved paths: `tests/run_agent` merged into `tests/agent` (170 of 183 files moved), and `tests/test_hermes_state.py` moved to `tests/hermes_state/test_hermes_state.py`.
+- **Pre run: DONE.** `/tmp/rs-pre` via `/tmp/rs-runtests.sh`: 765 failed, 18,740 passed, 141 skipped, 3 xfailed, 2 errors, in 1:02:04. `/tmp/rs-base-pre.fail` holds **778 named entries**. That large baseline is itself environment noise to triage; the named set is the reference, not the count.
+- **Post run: RUNNING** in the background (pid 86977, started about 11:07). It was at 18% after 21 min, so expect roughly 2h in total. Check it with `cat /tmp/rs-post.exit` once that file exists. The runner is `.resync/rs-runtests-post.sh`. It is the same suite with v2026.9.21's moved paths: `tests/run_agent` merged into `tests/agent` (170 of 183 files moved), and `tests/test_hermes_state.py` moved to `tests/hermes_state/test_hermes_state.py`.
   - The original runner exits 4 on the resync tree because `tests/run_agent` is gone. Do not use it for POST.
   - The post run writes `/tmp/rs-post.fail`.
 - **Upstream reference run** (`/tmp/rs-up`): it died with a **segfault** (exit 139) in a `title_generator` → `_emit_warning` background thread. That is upstream code, not a carry. It is not needed for the diff, and it can be rerun if a post-only failure needs attribution.
