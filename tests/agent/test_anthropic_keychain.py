@@ -243,6 +243,17 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
         result = _refresh_oauth_token({"refreshToken": "stale", "expiresAt": 1})
         assert result == "already-refreshed-token"
 
+    @pytest.mark.xfail(
+        reason=(
+            "LOCAL oauth-credential-read-only (see PATCHES.md): upstream test asserts that Hermes "
+            "POSTs Claude Code's single-use refresh token (refresh_anthropic_oauth_pure) and/or "
+            "writes ~/.claude/.credentials.json (_write_claude_code_credentials). The local patch "
+            "deliberately removes that path -- Hermes never refreshes or writes Claude Code's OAuth "
+            "credential (it races CC's own refresh); it re-reads and delegates to the owner. "
+            "Deliberate divergence, not a regression. Re-evaluate at each resync."
+        ),
+        strict=True,
+    )
     def test_falls_back_to_network_refresh_when_no_fresh_credential(self, tmp_path, monkeypatch):
         """When no live source has a valid token, fall back to refreshing
         ourselves using the freshest available refresh token.
@@ -279,6 +290,17 @@ class TestRefreshOAuthTokenAdoptsFreshCredential:
         # Prefers the live source's refresh token over the caller's stale copy.
         assert captured["refresh_token"] == "live-refresh"
 
+    @pytest.mark.xfail(
+        reason=(
+            "LOCAL oauth-credential-read-only (see PATCHES.md): upstream test asserts that Hermes "
+            "POSTs Claude Code's single-use refresh token (refresh_anthropic_oauth_pure) and/or "
+            "writes ~/.claude/.credentials.json (_write_claude_code_credentials). The local patch "
+            "deliberately removes that path -- Hermes never refreshes or writes Claude Code's OAuth "
+            "credential (it races CC's own refresh); it re-reads and delegates to the owner. "
+            "Deliberate divergence, not a regression. Re-evaluate at each resync."
+        ),
+        strict=True,
+    )
     def test_concurrent_refreshes_use_one_shared_credentials_lock(self, tmp_path, monkeypatch):
         """Direct resolver refreshes must not spend one Claude token twice."""
         shared_credentials_path = tmp_path / ".claude" / ".credentials.json"

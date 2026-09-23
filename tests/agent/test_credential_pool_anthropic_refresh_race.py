@@ -246,6 +246,17 @@ def test_concurrent_hermes_pkce_refresh_loses_credential_despite_valid_token_on_
     )
 
 
+@pytest.mark.xfail(
+    reason=(
+        "LOCAL oauth-credential-read-only (see PATCHES.md): upstream test asserts that Hermes "
+        "POSTs Claude Code's single-use refresh token (refresh_anthropic_oauth_pure) and/or "
+        "writes ~/.claude/.credentials.json (_write_claude_code_credentials). The local patch "
+        "deliberately removes that path -- Hermes never refreshes or writes Claude Code's OAuth "
+        "credential (it races CC's own refresh); it re-reads and delegates to the owner. "
+        "Deliberate divergence, not a regression. Re-evaluate at each resync."
+    ),
+    strict=True,
+)
 def test_concurrent_claude_code_refresh_recovers_via_credentials_file(monkeypatch):
     """Contrast case: entry.source == 'claude_code' DOES recover from a lost
     race, because ``_sync_anthropic_entry_from_credentials_file`` re-reads
