@@ -70,8 +70,13 @@ def _tool_result_message_kwargs(agent, messages: list) -> dict:
     ``agent._untrusted_fence_state`` is a per-turn mutable dict reset in
     ``turn_context._reset_per_turn_agent_state``; ``find_last_user_message_text``
     re-derives "the live question" from the transcript itself.
+
+    The re-anchor fails CLOSED (ornith-model-class-gate): an agent lacking
+    ``_frame_reanchor_enabled`` never had an explicit decision made about it, so the
+    feature is OFF. Never append undeclared text to a tool result by default; it is
+    indistinguishable from injection.
     """
-    if not getattr(agent, "_frame_reanchor_enabled", True):
+    if not getattr(agent, "_frame_reanchor_enabled", False):
         reanchor_question = None
     else:
         reanchor_question = find_last_user_message_text(messages) or None

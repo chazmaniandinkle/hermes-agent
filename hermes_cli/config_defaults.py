@@ -155,13 +155,18 @@ DEFAULT_CONFIG = {
         # Ornith derail fix F4: after a tool result larger than threshold_bytes, append
         # one minimal line naming the live user question ("frame capture" guard).
         "frame_reanchor": {
-            "enabled": True,
+            # ``enabled: None`` means AUTO -- defer to the model-class gate in
+            # ``agent.agent_init._small_model_mitigations_default()`` (ornith-model-class-gate).
+            # A hardcoded ``True`` here silently defeated that gate: load_config() merges
+            # DEFAULT_CONFIG, so the explicit key always won. Set True/False to force it.
+            "enabled": None,
             "threshold_bytes": 4096,
         },
         # Ornith derail fix F3: re-inject a compact tool-name-only list near the end of
         # context assembly each turn (recency beats primacy for small models).
         "tool_inventory_pinning": {
-            "enabled": True,
+            # ``enabled: None`` = AUTO, same model-class gate as frame_reanchor above.
+            "enabled": None,
         },
         # Ornith derail fix F2: "prefill" resends the truncated text as a trailing
         # assistant turn (mechanical continuation); "instruction" uses the older

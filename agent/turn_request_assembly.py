@@ -192,7 +192,10 @@ def assemble_api_request(
     # had a tool it had just used four times. A one-line, names-only reminder at the very
     # end of context assembly is cheap insurance. Appended to the last message's own
     # content (not a new message) so role-alternation-strict providers are undisturbed.
-    if getattr(agent, "_tool_inventory_pinning_enabled", True):
+    # Fails CLOSED (ornith-model-class-gate): an absent attribute means no construction
+    # path made an explicit decision, and the append lands in whatever message is last
+    # (tool results included), where it is indistinguishable from hostile injection.
+    if getattr(agent, "_tool_inventory_pinning_enabled", False):
         from agent.conversation_loop import _build_tool_inventory_pin
 
         _pin_line = _build_tool_inventory_pin(agent.tools)
