@@ -233,6 +233,82 @@ def _reset_hygiene_failure_streak(gateway, session_key: str) -> None:
             logger.debug("hygiene failure streak persistent reset failed: %s", exc)
 
 
+# Guard B — compaction-failure escalation (#context-blowup).
+#
+# Session hygiene tries to auto-compress an oversized transcript BEFORE the
+# turn runs. When that keeps aborting (summary model times out / returns no
+# output), the current behaviour is to warn and *continue without compression*
+# — so the turn then dispatches the full, over-limit context and the loop
+# re-sends it on every empty-response retry. That is safe for the FIRST couple
+# of aborts (transient provider blips) but must NOT repeat forever: if
+# compaction cannot reduce the context, the session must stop re-sending an
+# over-limit context.
+#
+# N = 3, chosen to mirror the existing failure-cooldown multiplier ladder
+# (_HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9), which caps its escalation
+# at a streak of 3) and the agent's max_compression_attempts (3). Two
+# consecutive failures can still be a transient blip; requiring three keeps
+# current behaviour for the first two real aborts and guarantees the session
+# stops burning full-context sends no later than the third. The count is the
+# existing persistent ``hygiene_failure_streak`` (rotation-stable per
+# session_key), which is already incremented on every abort and reset to 0 by
+# ``_reset_hygiene_failure_streak`` after a compaction that recovered context.
+_HYGIENE_ESCALATE_AFTER = 3
+
+
+class SessionHygieneCompactionExhausted(Exception):
+    """Raised after N consecutive compaction aborts to abort the turn.
+
+    Reuses the same dispatch-aborting pattern the hygiene TIMEOUT branch already
+    uses (``gateway/run.py`` raises out of ``_handle_message_with_agent`` on a
+    timeout so the oversized context is never re-dispatched). Raising here keeps
+    a wedged session from continuing into a fresh agent + full-context send once
+    compaction has provably failed N times in a row.
+    """
+
+
+def hygiene_abort_escalation_reached(
+    streak: int,
+    threshold: int = _HYGIENE_ESCALATE_AFTER,
+) -> bool:
+    """True once the consecutive-abort streak reaches ``threshold``.
+
+    First ``threshold - 1`` aborts keep current (warn-and-continue) behaviour;
+    at/after ``threshold`` the session must escalate loudly and stop re-sending.
+    ``threshold <= 0`` disables escalation (returns False) so operators can turn
+    it off.
+    """
+    if threshold <= 0:
+        return False
+    return streak >= threshold
+
+
+def _peek_hygiene_failure_streak(gateway, session_key: str) -> int:
+    """Read the current consecutive-abort streak, or 0 on any failure.
+
+    Returns 0 (never escalates) on error so a broken/missing state store cannot
+    wrongly wedge a session into refusing all turns.
+    """
+    try:
+        state = gateway._peek_session_state(session_key)
+        if state is None:
+            return 0
+        return int(getattr(state.persistent, "hygiene_failure_streak", 0) or 0)
+    except Exception:
+        return 0
+
+
+def hygiene_escalation_user_message(threshold: int = _HYGIENE_ESCALATE_AFTER) -> str:
+    """Distinct operator-facing message sent once escalation has triggered."""
+    return (
+        "⚠️ Context compression has failed "
+        f"{threshold} consecutive times and the session remains over the model "
+        "window. Auto-compaction can no longer reduce it, so this session is "
+        "refusing to re-send an over-limit context. Please /reset for a clean "
+        "session now, or fix your auxiliary.compression model configuration."
+    )
+
+
 def hygiene_compaction_recovered(
     *,
     aborted: bool,
@@ -2013,6 +2089,77 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_cfg["search_slow_ms"])
 
 
+def _bridge_plugin_auxiliary_env(home: "Path") -> None:
+    """Bridge config.yaml's ``auxiliary.*`` block into AUXILIARY_<KEY>_* env vars.
+
+    Covers the built-in tasks (vision, web_extract, approval) plus any
+    plugin-registered auxiliary task returned by ``get_plugin_auxiliary_tasks()``.
+
+    MUST NOT be called from gateway/run.py module scope — see the comment at
+    the auxiliary-bridging call site (former location, now just a pointer
+    comment, near the top of this module) for why: it calls
+    get_plugin_auxiliary_tasks() -> PluginManager.discover_and_load(), which
+    can block on PluginManager._discovery_lock while a background discovery
+    thread concurrently blocks importing this same module (gateway.run) from
+    a plugin's register() — an import-lock/discovery-lock deadlock. Call this
+    only after `import gateway.run` has completed, e.g. from
+    GatewayRunner.start() before the first agent turn.
+    """
+    config_path = home / 'config.yaml'
+    if not config_path.exists():
+        return
+    try:
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+        # Presence-sensitive env bridge: raw read is deliberate (only keys the
+        # user actually wrote get bridged); overlay + expansion applied below.
+        cfg = read_user_config_raw(config_path)
+        cfg = _expand_env_vars(cfg)
+        if not isinstance(cfg, dict):
+            cfg = {}
+        try:
+            from hermes_cli import managed_scope
+            cfg = managed_scope.apply_managed_overlay(cfg)
+        except Exception:
+            pass
+    except Exception:
+        return
+
+    _auxiliary_cfg = cfg.get("auxiliary", {})
+    if not (_auxiliary_cfg and isinstance(_auxiliary_cfg, dict)):
+        return
+
+    # Built-in tasks that previously had explicit env-var bridging. Kept here
+    # as the canonical bridged set; plugin tasks are added via the plugin
+    # auxiliary registry below.
+    _aux_bridged_keys = {"vision", "web_extract", "approval"}
+    try:
+        from hermes_cli.plugins import get_plugin_auxiliary_tasks
+        for _entry in get_plugin_auxiliary_tasks():
+            _aux_bridged_keys.add(_entry["key"])
+    except Exception:
+        # Plugin discovery failure must not break gateway startup; built-in
+        # bridging stays intact.
+        pass
+
+    for _task_key in _aux_bridged_keys:
+        _task_cfg = _auxiliary_cfg.get(_task_key, {})
+        if not isinstance(_task_cfg, dict):
+            continue
+        _prov = str(_task_cfg.get("provider", "")).strip()
+        _model = str(_task_cfg.get("model", "")).strip()
+        _base_url = str(_task_cfg.get("base_url", "")).strip()
+        _api_key = str(_task_cfg.get("api_key", "")).strip()
+        _upper = _task_key.upper()
+        if _prov and _prov != "auto":
+            os.environ[f"AUXILIARY_{_upper}_PROVIDER"] = _prov
+        if _model:
+            os.environ[f"AUXILIARY_{_upper}_MODEL"] = _model
+        if _base_url:
+            os.environ[f"AUXILIARY_{_upper}_BASE_URL"] = _base_url
+        if _api_key:
+            os.environ[f"AUXILIARY_{_upper}_API_KEY"] = _api_key
+
+
 def _current_max_iterations() -> int:
     """Return the current per-turn iteration budget after runtime env refresh."""
     _reload_runtime_env_preserving_config_authority()
@@ -2261,44 +2408,27 @@ if _config_path.exists():
         # Compression config is read directly from config.yaml by run_agent.py
         # and auxiliary_client.py — no env var bridging needed.
         # Auxiliary model/direct-endpoint overrides (vision, web_extract,
-        # approval, plus any plugin-registered auxiliary tasks).
-        # Each task has provider/model/base_url/api_key; bridge non-default
-        # values to env vars named AUXILIARY_<KEY_UPPER>_*. The legacy
-        # hard-coded list (vision/web_extract/approval) is replaced by a
-        # dynamic loop so plugin-registered tasks benefit from the same
-        # config→env bridging without core knowing about each one.
-        _auxiliary_cfg = _cfg.get("auxiliary", {})
-        if _auxiliary_cfg and isinstance(_auxiliary_cfg, dict):
-            # Built-in tasks that previously had explicit env-var bridging.
-            # Kept here as the canonical bridged set; plugin tasks are added
-            # below via the plugin auxiliary registry.
-            _aux_bridged_keys = {"vision", "web_extract", "approval"}
-            try:
-                from hermes_cli.plugins import get_plugin_auxiliary_tasks
-                for _entry in get_plugin_auxiliary_tasks():
-                    _aux_bridged_keys.add(_entry["key"])
-            except Exception:
-                # Plugin discovery failure must not break gateway startup;
-                # built-in bridging stays intact.
-                pass
-
-            for _task_key in _aux_bridged_keys:
-                _task_cfg = _auxiliary_cfg.get(_task_key, {})
-                if not isinstance(_task_cfg, dict):
-                    continue
-                _prov = str(_task_cfg.get("provider", "")).strip()
-                _model = str(_task_cfg.get("model", "")).strip()
-                _base_url = str(_task_cfg.get("base_url", "")).strip()
-                _api_key = str(_task_cfg.get("api_key", "")).strip()
-                _upper = _task_key.upper()
-                if _prov and _prov != "auto":
-                    os.environ[f"AUXILIARY_{_upper}_PROVIDER"] = _prov
-                if _model:
-                    os.environ[f"AUXILIARY_{_upper}_MODEL"] = _model
-                if _base_url:
-                    os.environ[f"AUXILIARY_{_upper}_BASE_URL"] = _base_url
-                if _api_key:
-                    os.environ[f"AUXILIARY_{_upper}_API_KEY"] = _api_key
+        # approval, plus any plugin-registered auxiliary tasks) used to be
+        # bridged right here. Moved to _bridge_plugin_auxiliary_env() (below,
+        # module scope but NOT called here) and invoked instead from
+        # GatewayRunner.start(), before the first agent turn.
+        #
+        # WHY: this block calls get_plugin_auxiliary_tasks(), which triggers
+        # PluginManager.discover_and_load() — a blocking acquire of
+        # PluginManager._discovery_lock plus arbitrary plugin-code imports.
+        # Running that from gateway/run.py's *module body* means the caller
+        # still holds CPython's per-module import lock for `gateway.run`
+        # (we are mid `import gateway.run`). If the plugin-discovery
+        # background thread (start_background_plugin_discovery) is
+        # concurrently loading a plugin whose register() does
+        # `from gateway.run import ...` (e.g. the darkstar profile's
+        # skill_relevance_gate), that thread blocks on the gateway.run
+        # import lock while holding _discovery_lock — a two-lock cycle with
+        # opposite acquisition order, so neither side can proceed and
+        # nothing times out. Confirmed by faulthandler dump, 2026-09-10
+        # (darkstar profile, 8 consecutive reproductions). Deferring this
+        # call to after `import gateway.run` has completed (module lock
+        # already released) breaks the cycle.
         # config.yaml is the documented, authoritative source for these
         # settings — it unconditionally wins over .env values. Previously
         # the guards below read `if X not in os.environ` and let stale
@@ -12153,6 +12283,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        # Bridge config.yaml's auxiliary.* block (vision/web_extract/approval
+        # + any plugin-registered auxiliary task) into AUXILIARY_<KEY>_* env
+        # vars. Deliberately done here — after `import gateway.run` has
+        # completed — and not at module scope: see
+        # _bridge_plugin_auxiliary_env()'s docstring for the import-lock /
+        # plugin-discovery-lock deadlock this call site avoids.
+        try:
+            _bridge_plugin_auxiliary_env(_hermes_home)
+        except Exception:
+            logger.debug("plugin auxiliary env bridging failed", exc_info=True)
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
         # pythonw / detached service) — otherwise the gateway would die
@@ -19436,6 +19576,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 time.monotonic() - _hyg_wait_started,
                                                 _hyg_total_ceiling_seconds,
                                             )
+                                            # Guard B escalation: distinct
+                                            # signature once compaction has timed
+                                            # out with no progress N consecutive
+                                            # times (this branch already aborts
+                                            # the dispatch via the raise below;
+                                            # the signature makes the state-gov
+                                            # conformance probe and the incident
+                                            # triage greppable).
+                                            _escal_streak = _peek_hygiene_failure_streak(
+                                                self, session_key
+                                            )
+                                            if hygiene_abort_escalation_reached(_escal_streak):
+                                                logger.critical(
+                                                    "Session hygiene: compaction timed out "
+                                                    "with no progress %s consecutive times "
+                                                    "for session %s (escalation threshold "
+                                                    "%s) — refusing to re-dispatch an "
+                                                    "over-limit context; aborting turn",
+                                                    _escal_streak,
+                                                    session_entry.session_id,
+                                                    _HYGIENE_ESCALATE_AFTER,
+                                                )
                                             _timeout_msg = (
                                                 "⚠️ Context compression timed out "
                                                 f"after {_hyg_timeout_seconds:.1f}s "
@@ -19696,6 +19858,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 "Failed to deliver compression-failure warning to user: %s",
                                                 _werr,
                                             )
+                                    # Guard B escalation: once compaction has
+                                    # aborted N consecutive times, do NOT fall
+                                    # through to dispatch the over-limit context
+                                    # again. Emit a DISTINCT signature and abort
+                                    # the turn (same dispatch-aborting pattern as
+                                    # the hygiene TIMEOUT branch's raise above).
+                                    _escal_streak = _peek_hygiene_failure_streak(
+                                        self, session_key
+                                    )
+                                    if hygiene_abort_escalation_reached(_escal_streak):
+                                        logger.critical(
+                                            "Session hygiene: compaction aborted "
+                                            "%s consecutive times for session %s "
+                                            "(escalation threshold %s) — refusing "
+                                            "to re-dispatch an over-limit context; "
+                                            "aborting turn",
+                                            _escal_streak,
+                                            session_entry.session_id,
+                                            _HYGIENE_ESCALATE_AFTER,
+                                        )
+                                        try:
+                                            _escal_adapter = self._adapter_for_source(source)
+                                            if _escal_adapter and source.chat_id:
+                                                await _escal_adapter.send(
+                                                    source.chat_id,
+                                                    hygiene_escalation_user_message(
+                                                        _HYGIENE_ESCALATE_AFTER
+                                                    ),
+                                                    metadata=_hyg_meta,
+                                                )
+                                        except Exception as _werr:
+                                            logger.warning(
+                                                "Failed to deliver hygiene "
+                                                "escalation warning to user: %s",
+                                                _werr,
+                                            )
+                                        raise SessionHygieneCompactionExhausted(
+                                            f"session {session_entry.session_id} "
+                                            f"compaction aborted {_escal_streak} "
+                                            "consecutive times"
+                                        )
                                     # Separately: if the user's CONFIGURED aux
                                     # model failed and we recovered by falling
                                     # back to the main model, tell them — a

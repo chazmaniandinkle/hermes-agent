@@ -600,6 +600,7 @@ class TestMacOSAudioOutputPolicy:
     and `afplay` only resolves on a real macOS host."""
 
     @pytest.mark.macos_only
+    @pytest.mark.real_audio_playback
     def test_play_audio_file_skips_sounddevice_on_macos(self, monkeypatch, sample_wav):
         """On macOS, WAV playback must not import sounddevice; it routes to afplay."""
 
@@ -1376,12 +1377,17 @@ class TestDefaultInputSamplerate:
             assert wf.getframerate() == 48000
 
 
+@pytest.mark.real_audio_playback
 class TestWSL2PowerShellFallback:
     """Regression tests for WSL2 PowerShell TTS fallback (issue #17608).
 
     On WSL2 without a PulseAudio bridge, ffplay/aplay have no audio device.
     play_audio_file() should insert a PowerShell-based player at the front
     of the player list when powershell.exe and ffmpeg are available.
+
+    Opts out of the autouse ``_audio_playback_guard``: the subject under test
+    IS ``play_audio_file``'s player-selection logic, so it must run for real.
+    Every test here stubs ``subprocess.Popen``, so no speaker is ever opened.
     """
 
     def _fake_check_output(self, responses):

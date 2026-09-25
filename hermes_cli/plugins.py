@@ -6410,10 +6410,19 @@ def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
     """Return the global manager after ensuring plugin discovery has run.
 
     Pass ``force=True`` to rescan in the current process.
+
+    Routed through discover_plugins() (not manager.discover_and_load()
+    directly) so this respects the join invariant documented on
+    start_background_plugin_discovery: "every synchronous consumer goes
+    through discover_plugins(), which joins this thread first — so no
+    caller can observe a half-loaded registry." Calling discover_and_load()
+    directly here bypassed that join, letting a synchronous caller race a
+    live background-discovery thread instead of waiting for it.
+    discover_plugins() takes no manager arg (it resolves its own via
+    get_plugin_manager()), so re-fetch the manager afterward to return it.
     """
-    manager = get_plugin_manager()
-    manager.discover_and_load(force=force)
-    return manager
+    discover_plugins(force=force)
+    return get_plugin_manager()
 
 
 def get_plugin_context_engine():

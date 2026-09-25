@@ -2566,6 +2566,14 @@ class TestAuxiliaryAuthRefreshRetry:
         with (
             patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "claude-haiku-4-5-20251001", None)}),
             patch("agent.anthropic_adapter.read_claude_code_credentials", side_effect=lambda: next(reads)),
+            # The actuator-presence check is a real `os.path.exists` on a
+            # machine-local path (`~/.hermes/bin/claude-token-refresh`). Left
+            # unmocked, this test only exercises the subprocess.run call on
+            # machines that happen to have that file -- CI never does, which
+            # silently skipped the actuator branch and failed the assertions
+            # below. Pin it present so the read-only contract under test is
+            # independent of the runner's filesystem.
+            patch("agent.anthropic_adapter.os.path.exists", return_value=True),
             patch("agent.anthropic_adapter.subprocess.run") as mock_run,
             patch(
                 "agent.anthropic_adapter.refresh_anthropic_oauth_pure",

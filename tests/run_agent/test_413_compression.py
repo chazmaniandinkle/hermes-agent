@@ -100,6 +100,14 @@ def agent():
         # covered explicitly by TestOverflowWithCompactionDisabled.
         a.compression_enabled = True
         a.save_trajectories = False
+        # These tests assert exact message content after compression/retry.
+        # The F3 tool-inventory pin (agent_init._small_model_mitigations_default)
+        # defaults ON for agents whose provider/base_url/model don't match a
+        # known frontier signature -- which is every agent built directly via
+        # AIAgent(...) here, since none of those kwargs are passed. Pin it off
+        # explicitly so this suite's exact-content assertions aren't coupled to
+        # an unrelated mitigation's default-gate heuristic.
+        a._tool_inventory_pinning_enabled = False
         return a
 
 

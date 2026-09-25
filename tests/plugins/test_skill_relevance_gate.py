@@ -28,8 +28,24 @@ import pytest
 # ---------------------------------------------------------------------------
 # Path setup — add plugin dir so `import skill_relevance_gate` resolves
 # ---------------------------------------------------------------------------
+#
+# `skill_relevance_gate` is user-space, machine-local plugin (see PATCHES.md
+# `untracked-test-and-skill-residue` / `skill-relevance-gate-plugin`): it
+# lives at ~/.hermes/plugins/skill_relevance_gate/, not in this repo, and is
+# still pending an audit for hardcoded site-specific assumptions before it's
+# a candidate for vendoring in. On any machine without that plugin installed
+# (every CI runner) this whole module is untestable by construction — skip
+# it explicitly rather than letting `import skill_relevance_gate` raise
+# ModuleNotFoundError, which pytest reports as a failure, not an environment
+# gap.
 
 _PLUGIN_DIR = Path.home() / ".hermes" / "plugins" / "skill_relevance_gate"
+if not (_PLUGIN_DIR / "__init__.py").is_file():
+    pytest.skip(
+        f"skill_relevance_gate plugin not installed at {_PLUGIN_DIR} "
+        "(user-space plugin, not vendored into this repo)",
+        allow_module_level=True,
+    )
 if str(_PLUGIN_DIR.parent) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR.parent))
 

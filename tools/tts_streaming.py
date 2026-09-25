@@ -486,3 +486,121 @@ class XAIStreamer(StreamingTTSProvider):
                     return
                 logger.warning("xAI WS receive failed: %s", exc)
                 return
+
+
+# ---------------------------------------------------------------------------
+# Provider: Mod³ (local TTS server)
+# ---------------------------------------------------------------------------
+# The server is local and keyless, so ``available()`` is a live health probe
+# rather than a credential check — reachability *is* availability. A down
+# server makes ``resolve_streaming_provider`` return None, and the dispatcher
+# transparently falls back to the per-sentence sync path instead of failing.
+
+_MOD3_DEFAULT_BASE_URL = "http://127.0.0.1:7860"
+_MOD3_PROBE_TIMEOUT_SECONDS = 1.5
+_MOD3_SYNTH_TIMEOUT_SECONDS = 60
+_MOD3_DEFAULT_VOICE = "eng_uk_m_davids"
+
+
+def _mod3_base_url() -> str:
+    """Resolve the Mod³ base URL: ``MOD3_URL`` env, else the local default.
+
+    ``available()`` is a staticmethod (the ABC fixes that signature), so it
+    cannot read ``tts.mod3.base_url`` — env is the only knob it can honour.
+    ``stream()`` additionally accepts a per-request ``base_url`` in
+    ``tts.mod3`` for the actual call.
+    """
+    return (get_env_value("MOD3_URL") or _MOD3_DEFAULT_BASE_URL).strip().rstrip("/")
+
+
+@register("mod3")
+class Mod3Streamer(StreamingTTSProvider):
+    """Local Mod³ server (``POST /v1/synthesize``) → raw int16 PCM.
+
+    Mod³'s ``format: pcm`` returns bare little-endian int16 samples at its
+    native rate — exactly the wire contract this ABC specifies — so there is
+    no container handling or transcoding on either side of the pipe.
+
+    ``sample_rate`` is 24 kHz because every Mod³ engine (chatterbox,
+    chatterbox-turbo, kokoro, voxtral) renders at 24 kHz. It is fixed before
+    streaming starts: the speak-stream handler sends ``{"type": "start",
+    "sample_rate": ...}`` from this attribute *before* any audio arrives, so
+    a server that rendered at some other rate would play back pitch-shifted.
+    ``_check_sample_rate`` therefore verifies the server's reported rate on
+    every response and warns loudly rather than failing silently. Override
+    with ``tts.mod3.sample_rate`` if a future engine breaks that invariant.
+    """
+
+    sample_rate = 24000
+
+    @staticmethod
+    def available() -> bool:
+        """True when Mod³ answers /health and reports its TTS modality up."""
+        try:
+            import requests
+
+            response = requests.get(
+                f"{_mod3_base_url()}/health",
+                timeout=_MOD3_PROBE_TIMEOUT_SECONDS,
+            )
+            if response.status_code != 200:
+                return False
+            body = response.json()
+            return bool((body.get("modalities") or {}).get("tts"))
+        except Exception as exc:  # noqa: BLE001 — unreachable == unavailable
+            logger.debug("mod3 streaming provider unavailable: %s", exc)
+            return False
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        import requests
+
+        base_url = (
+            str(self.section.get("base_url") or "").strip().rstrip("/")
+            or _mod3_base_url()
+        )
+        voice = str(self.section.get("voice") or "").strip() or _MOD3_DEFAULT_VOICE
+        speed = self.section.get("speed", 1.0)
+
+        def _pcm() -> Iterator[bytes]:
+            with requests.post(
+                f"{base_url}/v1/synthesize",
+                json={
+                    "text": text,
+                    "voice": voice,
+                    "speed": speed,
+                    "format": "pcm",
+                },
+                timeout=_MOD3_SYNTH_TIMEOUT_SECONDS,
+                stream=True,
+            ) as response:
+                response.raise_for_status()
+                self._check_sample_rate(response)
+                # Mod³ buffers the whole utterance before responding (it calls
+                # list(generate_audio(...)) rather than streaming), so this
+                # iterates one already-complete body. Per-sentence latency is
+                # therefore sentence-length, not first-chunk — which is still
+                # conversational, because the chunker emits one sentence at a
+                # time. Making Mod³ stream would need a StreamingResponse over
+                # generate_audio there, not a change here.
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+
+        yield from _capped(_pcm(), "Mod3 streaming TTS")
+
+    def _check_sample_rate(self, response) -> None:
+        """Verify the server's reported rate matches the one we announced.
+
+        A mismatch means playback is pitch-shifted — the WS ``start`` frame
+        was already sent from ``self.sample_rate``, so this cannot be
+        corrected mid-stream. Warn with the exact countermeasure instead.
+        """
+        reported = str(response.headers.get("x-mod3-sample-rate") or "").strip()
+        if reported and reported.isdigit() and int(reported) != int(self.sample_rate):
+            logger.warning(
+                "Mod3 rendered at %s Hz but the streaming provider announced %s Hz; "
+                "playback will be pitch-shifted. Set tts.mod3.sample_rate: %s to match.",
+                reported,
+                self.sample_rate,
+                reported,
+            )
